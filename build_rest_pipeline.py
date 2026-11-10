@@ -60,7 +60,10 @@ DEFAULT_OUT = PROJECT / 'output'
 DEFAULT_IMG_DIR = PROJECT / 'data'
 N_CALIB = 20
 
-WEIGHTS = PROJECT / 'sharp_2572gikvuh.pt'
+# apple/ml-sharp checkout (src/ + checkpoint). Defaults to this script's dir for
+# backward compat; override with --sharp_root or the SHARP_ROOT env var.
+SHARP_ROOT = Path(os.environ.get('SHARP_ROOT', PROJECT)).resolve()
+WEIGHTS = SHARP_ROOT / 'sharp_2572gikvuh.pt'
 
 FORMAT_MAP = {
     'int16': {'w': 16, 'a': 16},
@@ -78,7 +81,12 @@ DLC_NAME_MAP = {
     'rest_seg_c':    'rest_c',
 }
 
-CUTS = [52, 84]
+# rest split points (topological node indices of the simplified rest.onnx).
+# None = automatic (see _auto_cuts): seg B ends right after the node producing
+# `disparity` (the app copies disparity from rest_b), seg A/B is cut where the
+# fewest bytes cross. Hard-coded [52, 84] matched upstream's export only; with
+# torch 2.8 it put `disparity` in seg C. Override with --cuts A,B.
+CUTS = None
 
 CONVERTER_NAMES = ('qairt-converter', 'qnn-converter', 'qnn-onnx-converter')
 QUANTIZER_NAMES = ('qairt-quantizer', 'qnn-quantizer')
@@ -129,7 +137,7 @@ _DEFAULT_VERSIONS = {
 def _pip_version(pip_name):
     """从 requirements.txt 读取版本号, 读不到用兜底版本。
     Read the version from requirements.txt; fall back to the default if unreadable."""
-    req = PROJECT / 'requirements.txt'
+    req = SHARP_ROOT / 'requirements.txt'
     if req.exists():
         try:
             for line in req.read_text(encoding='utf-8').splitlines():
@@ -166,7 +174,7 @@ def _require_py(package, hint=''):
 
 
 def _require_src():
-    src = PROJECT / 'src'
+    src = SHARP_ROOT / 'src'
     if not src.exists():
         fail(f"缺少本项目源码目录: {src}\n请将脚本放在 ML-Sharp 项目根目录下运行\n"
         f"Missing project source directory: {src}\nPlace this script in the ML-Sharp project root")
@@ -426,6 +434,40 @@ def export_onnx(scope, out_dir):
 # ── rest 拆分 (纯 onnx, 不依赖 torch) ─────────────────────────────
 # ── rest split (pure onnx, torch-free) ───────────────────────────
 
+def _crossing_bytes(m):
+    """bytes[k] = float32 bytes of tensors produced before node k and consumed at/after k."""
+    g = m.graph
+    size = {}
+    for vi in list(g.value_info) + list(g.output) + list(g.input):
+        n = 1
+        for d in vi.type.tensor_type.shape.dim:
+            n *= max(d.dim_value, 1)
+        size[vi.name] = n * 4
+    nodes = list(g.node)
+    prod = {o: i for i, n in enumerate(nodes) for o in n.output if o}
+    last = {}
+    for i, n in enumerate(nodes):
+        for t in n.input:
+            if t:
+                last[t] = i
+    for o in g.output:
+        last[o.name] = len(nodes)
+    return [sum(size.get(t, 0) for t, p in prod.items() if p < k and last.get(t, -1) >= k)
+            for k in range(len(nodes) + 1)], prod
+
+
+def _auto_cuts(m):
+    cross, prod = _crossing_bytes(m)
+    if 'disparity' not in prod:
+        fail("rest.onnx 无 disparity 输出 / rest.onnx has no 'disparity' output")
+    cut_b = prod['disparity'] + 1
+    lo, hi = max(1, cut_b // 4), max(2, cut_b - cut_b // 4)
+    cut_a = min(range(lo, hi), key=lambda k: cross[k])
+    log("split", f"auto cuts: [{cut_a}, {cut_b}] crossing A->B {cross[cut_a]/1e6:.0f} MB, "
+                 f"B->C {cross[cut_b]/1e6:.0f} MB")
+    return [cut_a, cut_b]
+
+
 def split_rest(out_dir):
     import onnx
     from onnx import helper, TensorProto
@@ -441,6 +483,9 @@ def split_rest(out_dir):
         m = onnx.shape_inference.infer_shapes(m)
     nodes = list(m.graph.node)
     log("split", f"总节点数: {len(nodes)} / Total nodes: {len(nodes)}")
+    global CUTS
+    if CUTS is None:
+        CUTS = _auto_cuts(m)
     log("split", f"切点: {CUTS} -> rest_a: 0-{CUTS[0]-1}, rest_b: {CUTS[0]}-{CUTS[1]-1}, rest_c: {CUTS[1]}-{len(nodes)-1}")
 
     orig_init_names = {init.name for init in m.graph.initializer}
@@ -1413,7 +1458,19 @@ def main():
     parser.add_argument('--pe_max', type=int, default=70, metavar='<n>',
                         help='PE校准样本总数上限, 35个位置均匀分配 (默认: 70)\n'
                              'PE calib sample cap, evenly over 35 slots (default: 70)')
+    parser.add_argument('--sharp_root', default=None, metavar='<dir>',
+                        help='apple/ml-sharp checkout containing src/ and sharp_2572gikvuh.pt\n'
+                             '(default: $SHARP_ROOT or this script\'s directory)')
+    parser.add_argument('--cuts', default=None, metavar='<a,b>',
+                        help='rest split node indices, e.g. 52,84 (default: auto)')
     args = parser.parse_args()
+    if args.cuts:
+        global CUTS
+        CUTS = [int(x) for x in args.cuts.split(',')]
+    if args.sharp_root:
+        global SHARP_ROOT, WEIGHTS
+        SHARP_ROOT = Path(args.sharp_root).expanduser().resolve()
+        WEIGHTS = SHARP_ROOT / 'sharp_2572gikvuh.pt'
 
     if args.task not in ('onnx', 'dlc', 'calib'):
         fail(f"未知任务: {args.task} (可选: onnx / dlc / calib) / "

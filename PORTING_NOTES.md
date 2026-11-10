@@ -181,6 +181,19 @@ What this means:
 * Self-check on the reference: 51/51 identical.
 * Reference image: `~/Codebase/ml-sharp/data/teaser.jpg` (Apple's, not committed). fpx = 1246.67, 1635×748, **1,179,648 Gaussians**.
 
+## 8d. A52s run 1 (2026-11-10): first on-device result
+
+Setup: debug APK (`0696772` + Home gating fix), QNN SDK 2.52 libs, upstream W8A16 DLCs and the local FP32 ONNX set side-loaded with `adb push`, input `teaser.jpg`, backend override Auto, tensor dump on.
+
+1. **The capability probe and fallback work on real hardware.** On the SD778G (v68), `probeHtpArch` found no HTP device. FastRPC initialised on the cDSP (domain 3), but `deviceGetPlatformInfo` reported nothing. The app logged `HTP unavailable (probeHtpArch: no HTP device reported) -> CPU fallback (ONNX Runtime)` and continued on ORT with 4 threads. There was no crash. This is the same path the A57 will take.
+2. **New gate found and fixed:** Home's Run button required the five *HTP* slots to be compiled. With only the ONNX set present (the A57 case) the app could never start a run. `canRun` now also accepts a complete ONNX set.
+3. **PE on CPU:** 35 patches in 352.7 s. Early patches took ~10 s each and later ones ~5 s (probably memory pressure and swapping from other apps settling). RSS ~1.34 GB.
+4. **REST_B does not fit in FP32 on a 5.5 GB phone.** lmkd killed the foreground app ~20 s into seg B ("min2x watermark is breached even after kill", 2.04 GB RSS + 590 MB swap), after first killing most background apps. On desktop, seg B peaks at **~4.6 GB** (arena on or off). The cause is the monodepth head at full resolution:
+   `md_head.0` Conv → [1,128,768,768] (302 MB), `md_head.1` ConvTranspose → **[1,128,1536,1536] (1208 MB)**, `md_head.2` Conv → [1,32,1536,1536] (302 MB), then 1×1 Conv → disparity [1,2,1536,1536]. On top of that come seg B's 878 MB of inputs and the decoder's 768²×256 activations (604 MB each).
+   * The head is purely local (3×3 conv, 2×2 stride-2 transposed conv, 3×3 conv, 1×1 conv), so it can be **run in spatial tiles with a small halo and give exact results**. The same holds for the full-resolution parts of seg C.
+   * For the A57 (8/12 GB), FP32 at ~4.6 GB peak probably fits; 8 GB is borderline.
+5. **HTP on the A52s:** to investigate. Is `deviceGetPlatformInfo` failing because of QNN 2.52 on v68, unsigned-PD support on SM7325, or missing env/skel at probe time? Upstream never claimed v68 support.
+
 ## 9. Open questions
 
 * **Q1** Approve ORT-CPU instead of QNN-CPU for Phase 1?
@@ -198,5 +211,5 @@ _No measurements yet._
 | Device | Backend | Precision | Threads | pre | PE ×35 | IE | merge | REST a+b+c | post | Total | Peak RSS | Accuracy |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Apple M4 Mac (desktop reference, onnxruntime 1.31.1 CPU, Python) | ORT CPU EP | FP32 | default | 0.04 s | 19.5 s | 1.8 s | 0.14 s | 15.1 s | 0.74 s | ~38 s | — | reference |
-| Galaxy A52s (SD778G) | HTP v68 | W8A16 | — | | | | | | | | | |
-| Galaxy A52s (SD778G) | ORT CPU EP | FP32 | 4 | | | | | | | | | |
+| Galaxy A52s (SD778G) | HTP v68 | W8A16 | — | n/a: HTP not detected (see A52s run 1) | | | | | | | | |
+| Galaxy A52s (SD778G), run 1 2026-11-10 | ORT 1.31.1 CPU EP (auto fallback) | FP32 | 4 | 0.68 s (+0.14 s decode) | **352.7 s** (load 7 s; 5–11 s/patch) | 4.6 s (load 5.8 s) | 2.4 s | A: 12.5 s (run 3.5 s, rest is writing 0.9 GB of edges); **B: killed by lmkd** | — | — | 2.04 GB RSS + 590 MB swap at kill | — |

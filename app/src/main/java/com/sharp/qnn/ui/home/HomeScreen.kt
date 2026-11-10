@@ -121,6 +121,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     /** Active inference backend (null until the first run initializes it) */
     val backend = sharpApp.pipelineManager.backend
     val models = sharpApp.modelStore.models
+
+    /** True when the CPU (ONNX Runtime) model set is complete in sharp_models/onnx/ */
+    fun onnxSetReady(): Boolean = sharpApp.modelStore.missingOnnxModels().isEmpty()
     val settingsFlow = sharpApp.settingsRepository.settingsFlow
 
     // Selected image Uri and file name (kept in the ViewModel across page switches)
@@ -566,10 +569,14 @@ fun HomeScreen(
         }
     }
 
-    val canRun = ModelType.coreTypes.all { type ->
+    // Runnable with either model set: the compiled HTP slots, or the ONNX set for the
+    // CPU fallback (re-checked whenever the HTP slots change or an image is picked)
+    val htpSetReady = ModelType.coreTypes.all { type ->
         val model = models[type]
         model != null && (model.format == ModelFormat.BIN || model.status == ModelStatus.COMPILED)
-    } && !pipelineState.isRunning && selectedImageUri != null
+    }
+    val onnxSetReady = remember(models, selectedImageUri) { vm.onnxSetReady() }
+    val canRun = (htpSetReady || onnxSetReady) && !pipelineState.isRunning && selectedImageUri != null
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(Spacing.lg),
@@ -814,7 +821,7 @@ fun HomeScreen(
                 }
             }
             val missing = ModelType.coreTypes.filter { !models.containsKey(it) }
-            if (missing.isNotEmpty()) {
+            if (missing.isNotEmpty() && !onnxSetReady) {
                 Text(
                     text = stringResource(
                         R.string.home_missing_models,

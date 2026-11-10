@@ -121,6 +121,28 @@ The cost is a small `OrtRuntime` class (~200 lines). It exposes the same `getInp
 6. Instrumentation: backend chip in the UI ("NPU (HTP)" / "CPU (ORT)"), per-stage ms, peak RSS from `VmHWM`. Add a debug switch that dumps raw model outputs to `files/dumps/`, plus `tools/compare_outputs.py` (desktop onnxruntime on a fixed image vs. the pulled dumps: cosine, max/mean abs error, Gaussian count).
 7. Expected (to be measured): very slow (minutes) and memory-heavy in REST (several GB peak at 1536²). That's acceptable for Phase 1 on an 8–12 GB device.
 
+## 8b. Test devices
+
+Decision (user): develop and experiment on the **A52s first**, then move to the A57. The same build must work on both and run better on the A57.
+
+| | Galaxy A52s 5G (dev device, connected) | Galaxy A57 (final target) |
+|---|---|---|
+| Model / build | SM-A528B, Android 14 (API 34), One UI build `A528BXXSBGYI3` | Android 16 / One UI 8.5 |
+| SoC | **Snapdragon 778G** (SM7325 "Yupik", board `lahaina`) | Exynos 1680 |
+| CPU | 4× Cortex-A78 (0xd41) @ 2.4 GHz + 4× Cortex-A55 (0xd05) @ 1.8 GHz. Features: `asimddp` (dotprod), `fphp/asimdhp` (FP16 arith). **No i8mm, no bf16.** | TBD (probe on device) |
+| GPU | Adreno 642L. `/vendor/lib64/libOpenCL.so` ✅, `vulkan.adreno.so` ✅ | Xclipse 550 (Vulkan ✅, OpenCL TBD) |
+| NPU | Hexagon 770, **HTP v68**. `libcdsprpc.so` present. The app already ships V68 stub/skel. README claims SD 8 Gen 2+ only, so V68 is untested by upstream. | none usable |
+| RAM | **5.5 GB total, ~1.4 GB `MemAvailable`** at probe time | 8 / 12 GB |
+| Free storage | 13 GB | TBD |
+
+What this means:
+* **The A52s is a Snapdragon device.** It doesn't reproduce the Exynos failures G1 (manifest) or G3 (HTP probe on a non-Qualcomm SoC). Those can only be confirmed on the A57. To exercise the CPU fallback on the A52s, Phase 1 needs a **"force backend" developer override** in Settings now rather than in Phase 2.
+* **The A52s can give us an HTP v68 baseline:** an on-device reference output and timing, if the current W8A16 path works on v68. HTP v68 support for 16-bit activations has to be verified.
+* **Memory is the binding constraint on the A52s.** An FP32 encoder alone is ~1.22 GB of weights, and REST works at 1536² with GB-scale activations. Expect a low-memory kill with plain FP32 on 5.5 GB. Plan per device class:
+  * ≥ 8 GB (A57): FP32 (or FP16-stored) weights.
+  * < 8 GB (A52s): int8 weight-only / dynamic-quant PE and IE (~310 MB each, uses dotprod), plus REST possibly split finer. Every model set goes through `compare_outputs.py`.
+* Defaults are chosen by RAM and CPU features at runtime, not by device name.
+
 ## 9. Open questions
 
 * **Q1** Approve ORT-CPU instead of QNN-CPU for Phase 1?

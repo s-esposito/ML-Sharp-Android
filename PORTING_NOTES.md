@@ -170,7 +170,8 @@ What this means:
 * `:app:compileDebugKotlin` passes. It's run with a placeholder `-Pqnn.sdk.dir`, since Kotlin compilation doesn't touch CMake.
 * `:app:extractOrt` unpacks the ORT headers and `libonnxruntime.so`.
 * `ort_runtime.cpp` passes a syntax check against the ORT 1.31.1 headers.
-* The native build (`sharp_jni.cpp`, `qnn_runtime.cpp`) is still blocked on the QNN SDK headers.
+* **QNN SDK:** the installed version is **2.52.0.261104** (QNN API v2.41) at `/Users/stefano/SDKs/qairt/2.52.0.261104`, not the 2.48 upstream used. All libraries and v68–v81 skels that `copyQnnLibs`/`copyQnnSkel` expect are present; the SDK also ships hexagon-v85, which the app doesn't package yet. The upstream W8A16 DLCs were converted with 2.48 and are now compiled on-device by the 2.52 runtime. This is a change to the HTP stack to watch during the HTP baseline. If on-device DLC compilation fails, try 2.48 first.
+* **`./gradlew :app:assembleDebug` passes, including the native code**, on the first full build. The APK is 152 MB: `libQnnHtpPrepare.so` 89.6 MB, `libonnxruntime.so` 34.2 MB, six skels at ~13.5 MB each in assets, `libsharp_qnn.so` 0.5 MB.
 * Cleanup also fixed: FP32 REST outputs are written without an extra copy, the ORT arena is enabled only for PE, the backend kind is an enum, and changing backend settings re-probes at the next run instead of tearing down on the UI thread.
 
 **Correctness tooling:**

@@ -164,7 +164,14 @@ What this means:
 * UI backend chip plus peak RSS; Settings > Inference backend (Auto/HTP/CPU, threads, tensor dump).
 * Log tags `SHARP_BACKEND`, `SHARP_BENCH`, `SHARP_ORT`.
 
-Not yet compiled for Android (needs the QNN SDK headers and NDK 29). `ort_runtime.cpp` was syntax-checked with host clang against the ORT 1.31.1 headers.
+**Build status (after cleanup commit `3db06a3`):**
+* NDK 29.0.14206865 and CMake 3.22.1 are installed in the Homebrew SDK; `local.properties` has `sdk.dir` (git-ignored).
+* Gradle 9.6.1 with AGP 8.7.3 configures fine.
+* `:app:compileDebugKotlin` passes. It's run with a placeholder `-Pqnn.sdk.dir`, since Kotlin compilation doesn't touch CMake.
+* `:app:extractOrt` unpacks the ORT headers and `libonnxruntime.so`.
+* `ort_runtime.cpp` passes a syntax check against the ORT 1.31.1 headers.
+* The native build (`sharp_jni.cpp`, `qnn_runtime.cpp`) is still blocked on the QNN SDK headers.
+* Cleanup also fixed: FP32 REST outputs are written without an extra copy, the ORT arena is enabled only for PE, the backend kind is an enum, and changing backend settings re-probes at the next run instead of tearing down on the UI thread.
 
 **Correctness tooling:**
 * `tools/host_post/` builds the app's own C core (prep/pre/merge/post) for the desktop, so the desktop reference uses the exact same C pre/post-processing.

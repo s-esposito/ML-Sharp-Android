@@ -63,6 +63,8 @@ class PipelineManager(
     // Runtime state
     @Volatile
     private var initialized = false
+    @Volatile
+    private var backendStale = false
     private val loadedModels = mutableSetOf<ModelType>()
     private val loadedModelsLock = Any()
     private var pipelineStartTime = 0L
@@ -137,13 +139,8 @@ class PipelineManager(
                 QnnJni.resetPeakRss()
                 modelLoadMs.clear()
                 ensureReadyForCompile()
-                _backend.value?.let { b ->
-                    _state.update { st ->
-                        st.copy(
-                            backendLabel = b.label,
-                            stages = if (b.isCpu) st.stages.filter { it.id != COMPILE_STAGE_ID } else st.stages
-                        )
-                    }
+                if (isCpuBackend) {
+                    _state.update { st -> st.copy(stages = st.stages.filter { it.id != COMPILE_STAGE_ID }) }
                 }
 
                 // Init stage done
@@ -255,9 +252,13 @@ class PipelineManager(
                 }
 
                 // Debug: dump raw model outputs (before in-place PLY optimization)
+                // (its copy time is excluded from the run's total)
+                var dumpMs = 0L
                 if (plySettings.dumpTensors) {
+                    val t0 = System.currentTimeMillis()
                     runCatching { dumpTensors(workDir, fpx, origW, origH) }
                         .onFailure { android.util.Log.w(TAG, "Tensor dump failed", it) }
+                    dumpMs = System.currentTimeMillis() - t0
                 }
 
                 // SOR / kNN Merge)
@@ -282,17 +283,15 @@ class PipelineManager(
                 }
 
                 // Done
-                val totalElapsed = System.currentTimeMillis() - pipelineStartTime
+                val totalElapsed = System.currentTimeMillis() - pipelineStartTime - dumpMs
                 android.util.Log.i(TAG, "=== Pipeline done, total ${totalElapsed}ms, PLY=$plyPath ===")
                 val peakMb = QnnJni.getPeakRssKb() / 1024
-                val summary = benchSummary(totalElapsed, peakMb)
-                android.util.Log.i(BENCH_TAG, summary)
+                android.util.Log.i(BENCH_TAG, benchSummary(totalElapsed, peakMb))
                 _state.value = _state.value.copy(
                     isRunning = false,
                     totalElapsedMs = totalElapsed,
                     errorMessage = null,
-                    peakRssMb = peakMb,
-                    benchSummary = summary
+                    peakRssMb = peakMb
                 )
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -335,12 +334,20 @@ class PipelineManager(
      * used instead. With the override set to HTP, an HTP failure is an error.
      */
     suspend fun ensureQnnInitialized() {
-        if (initialized) return
+        if (initialized && !backendStale) return
+        if (backendStale) {
+            // Settings changed the backend/threads: tear down so it is re-probed below
+            synchronized(loadedModelsLock) { loadedModels.clear() }
+            runCatching { QnnJni.nativeDestroy() }
+            initialized = false
+            backendStale = false
+            _backend.value = null
+        }
         // Notify the init stage (only effective in pipeline context; harmless otherwise)
         onProgress(PREPARE_STAGE_ID, 0, ModelType.coreTypes.size, 0, MsgKey.DETAIL_INIT_QNN)
-        // Pin the language for this call (compile progress details use it)
-        langCtx = LocaleUtil.wrap(context, settings.settingsFlow.first().language)
         val s = settings.settingsFlow.first()
+        // Pin the language for this call (compile progress details use it)
+        langCtx = LocaleUtil.wrap(context, s.language)
         val override = s.backendOverride
 
         val htpFailure: String? = if (override == SettingsRepository.BackendOverride.CPU) {
@@ -349,7 +356,7 @@ class PipelineManager(
             tryInitHtp(s)
         }
         if (htpFailure == null) {
-            _backend.value = BackendInfo(name = "HTP", threads = 0, fallbackReason = null)
+            _backend.value = BackendInfo(BackendKind.HTP, name = "HTP", threads = 0, fallbackReason = null)
             android.util.Log.i(BACKEND_TAG, "backend=HTP")
             initialized = true
             return
@@ -359,12 +366,25 @@ class PipelineManager(
             throw IOException(MsgKey.ERR_QNN_INIT)
         }
         android.util.Log.w(BACKEND_TAG, "HTP unavailable ($htpFailure) -> CPU fallback (ONNX Runtime)")
-        val ok = runCatching { QnnJni.nativeInitOrt(s.cpuThreads, false) }.getOrDefault(false)
+        val ok = runCatching { QnnJni.nativeInitOrt(s.cpuThreads) }.getOrDefault(false)
         if (!ok) throw IOException(MsgKey.ERR_QNN_NATIVE_INIT)
-        val info = BackendInfo(QnnJni.getBackendName(), QnnJni.getOrtThreads(), htpFailure)
+        val info = BackendInfo(BackendKind.CPU, QnnJni.getBackendName(), QnnJni.getOrtThreads(), htpFailure)
         _backend.value = info
         android.util.Log.i(BACKEND_TAG, "backend=${info.name} threads=${info.threads} reason=\"$htpFailure\"")
         initialized = true
+    }
+
+    /**
+     * Compile a DLC model into an HTP context binary (models tab). Initializes the
+     * backend first; fails with [MsgKey.ERR_NEEDS_NPU] on the CPU backend.
+     */
+    suspend fun compileDlc(type: ModelType): Result<Unit> {
+        val init = runCatching { ensureQnnInitialized() }
+        if (init.isFailure) {
+            return Result.failure(init.exceptionOrNull() ?: RuntimeException(MsgKey.ERR_QNN_INIT_DEFAULT))
+        }
+        if (isCpuBackend) return Result.failure(RuntimeException(MsgKey.ERR_NEEDS_NPU))
+        return modelStore.compileModel(type)
     }
 
     /** Try to bring up QNN HTP. Returns null on success, or the failure reason. */
@@ -408,19 +428,11 @@ class PipelineManager(
             .any { File(it).exists() }
 
     /**
-     * Tear down the native backend so the next run re-probes (e.g. after the backend
-     * override or thread count changed in settings). No-op while a run is active.
+     * Mark the backend for re-probing at the next init (after the backend override or
+     * CPU thread count changed). The teardown happens there, on the caller's IO thread.
      */
-    fun reinitBackend() {
-        if (!runMutex.tryLock()) return
-        try {
-            synchronized(loadedModelsLock) { loadedModels.clear() }
-            runCatching { QnnJni.nativeDestroy() }
-            initialized = false
-            _backend.value = null
-        } finally {
-            runMutex.unlock()
-        }
+    fun invalidateBackend() {
+        backendStale = true
     }
 
     private suspend fun ensureReadyForCompile() {

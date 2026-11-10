@@ -23,22 +23,9 @@
 #include "System/QnnSystemContext.h"
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpDeviceConfigShared.h"
+#include "proc_stats.h"
 
-// Current process RSS (kB) for peak tracking during load/execute (reads /proc/self/status)
-static size_t selfVmRSS_kB() {
-    FILE* f = fopen("/proc/self/status", "r");
-    if (!f) return 0;
-    char line[256];
-    size_t rss = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "VmRSS:", 6) == 0) {
-            sscanf(line + 6, "%zu", &rss);
-            break;
-        }
-    }
-    fclose(f);
-    return rss;
-}
+using sharp::selfVmRSS_kB;
 
 namespace qnn {
 
@@ -626,20 +613,7 @@ int HtpRuntime::loadFromBinary(const std::string& binPath, std::string& graphNam
     // the creation will very likely fail with OOM
     size_t rssBefore = selfVmRSS_kB();
     // Estimate available memory from /proc/meminfo
-    size_t memAvailKB = 0;
-    {
-        FILE* mf = fopen("/proc/meminfo", "r");
-        if (mf) {
-            char line[256];
-            while (fgets(line, sizeof(line), mf)) {
-                if (strncmp(line, "MemAvailable:", 13) == 0) {
-                    sscanf(line + 13, "%zu", &memAvailKB);
-                    break;
-                }
-            }
-            fclose(mf);
-        }
-    }
+    size_t memAvailKB = sharp::memAvailable_kB();
     // Use a safety factor of 3×: binary, context, and DDR copy may coexist briefly
     size_t estimatedPeakKB = ((size_t)binSize * 3) / 1024;
     if (memAvailKB > 0 && memAvailKB < estimatedPeakKB) {

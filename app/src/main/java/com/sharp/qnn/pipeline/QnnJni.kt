@@ -211,14 +211,13 @@ object QnnJni {
      * Initialize the ONNX Runtime (CPU) runtimes for the 5 core slots and make ORT the
      * active backend. Used when HTP is unavailable or the user forces CPU.
      * @param threads intra-op threads; <= 0 = big-core count
-     * @param useXnnpack append the XNNPACK EP (experimental; default CPU EP)
      */
-    external fun nativeInitOrt(threads: Int, useXnnpack: Boolean): Boolean
+    external fun nativeInitOrt(threads: Int): Boolean
 
     /** Load an .onnx model into the ORT runtime of a slot ("pe", "ie", "rest_a", ...) */
     external fun loadOnnxModel(modelType: String, onnxPath: String): Boolean
 
-    /** Active backend label: "HTP", "ORT-CPU", "ORT-XNNPACK", or "" if none */
+    /** Active backend label: "HTP", "ORT-CPU", or "" if none */
     external fun getBackendName(): String
 
     /** ORT intra-op thread count in use (0 when ORT is not active) */
@@ -229,9 +228,6 @@ object QnnJni {
 
     /** Peak RSS (VmHWM) in kB */
     external fun getPeakRssKb(): Long
-
-    /** Current RSS in kB */
-    external fun getRssKb(): Long
 
     /** Reset VmHWM to the current RSS (per-run peak tracking) */
     external fun resetPeakRss()

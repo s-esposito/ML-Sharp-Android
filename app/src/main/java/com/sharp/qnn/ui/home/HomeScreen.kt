@@ -117,6 +117,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val sharpApp = app as SHARPApplication
 
     val pipelineState = sharpApp.pipelineManager.state
+
+    /** Active inference backend (null until the first run initializes it) */
+    val backend = sharpApp.pipelineManager.backend
     val models = sharpApp.modelStore.models
     val settingsFlow = sharpApp.settingsRepository.settingsFlow
 
@@ -512,6 +515,7 @@ fun HomeScreen(
     snackbarHostState: SnackbarHostState = androidx.compose.runtime.remember { SnackbarHostState() }
 ) {
     val pipelineState by vm.pipelineState.collectAsState()
+    val backend by vm.backend.collectAsState()
     val models by vm.models.collectAsState()
     val settings by vm.settingsFlow.collectAsState(initial = SettingsRepository.DEFAULTS)
     val selectedImageUri by vm.selectedImageUri
@@ -860,11 +864,11 @@ fun HomeScreen(
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 // Active inference backend: "NPU (HTP)" / "CPU (ONNX Runtime, N threads)"
-                if (pipelineState.backendLabel.isNotEmpty()) {
+                backend?.let { b ->
                     Spacer(Modifier.size(Spacing.xs))
                     AssistChip(
                         onClick = {},
-                        label = { Text(stringResource(R.string.home_backend_chip, pipelineState.backendLabel)) }
+                        label = { Text(stringResource(R.string.home_backend_chip, b.label)) }
                     )
                 }
             }
@@ -905,11 +909,11 @@ fun HomeScreen(
                                 color = MaterialTheme.colorScheme.onTertiaryContainer
                             )
                             // One-line run summary: backend + peak memory
-                            if (pipelineState.backendLabel.isNotEmpty()) {
+                            backend?.let { b ->
                                 Text(
                                     text = stringResource(
                                         R.string.home_run_summary,
-                                        pipelineState.backendLabel,
+                                        b.label,
                                         pipelineState.peakRssMb
                                     ),
                                     style = MaterialTheme.typography.bodySmall,

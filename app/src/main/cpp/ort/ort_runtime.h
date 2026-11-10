@@ -12,25 +12,20 @@ namespace Ort { struct Session; struct Value; }
 
 namespace ortrt {
 
-struct OrtOptions {
-    int intraOpThreads = 0;      // 0 = let the caller's default apply (big-core count)
-    bool useXnnpack = false;     // Phase 3 experiment; CPU EP (MLAS) by default
-};
-
 class OrtRuntime : public sharp::ModelRuntime {
 public:
-    OrtRuntime();
+    // intraOpThreads: ORT intra-op thread count (> 0)
+    explicit OrtRuntime(int intraOpThreads);
     ~OrtRuntime() override;
 
-    // Marks the runtime usable (ORT env is created lazily, process-wide)
-    int init(const OrtOptions& opts);
-
     // Loads an .onnx model (external-data files resolved relative to the model path).
-    // Returns 0 on success.
-    int load(const std::string& onnxPath);
+    // useArena: keep ORT's CPU BFC arena. Worth it only for models run many times
+    // (PE, 35 runs); for single-run models it pins the peak until the session is
+    // freed, so streamed-out outputs never give memory back. Returns 0 on success.
+    int load(const std::string& onnxPath, bool useArena);
 
-    const char* backendName() const override { return m_opts.useXnnpack ? "ORT-XNNPACK" : "ORT-CPU"; }
-    bool isReady() const override { return m_ready; }
+    const char* backendName() const override { return "ORT-CPU"; }
+    bool isReady() const override { return true; }
     bool hasModel() const override { return m_session != nullptr; }
 
     const std::vector<sharp::TensorInfo>& getInputInfos() const override { return m_inputInfos; }
@@ -44,14 +39,13 @@ public:
 
     void freeGraph() override;
 
+    int threads() const { return m_threads; }
+
 private:
-    OrtOptions m_opts;
-    bool m_ready = false;
+    int m_threads;
     std::unique_ptr<Ort::Session> m_session;
     std::vector<sharp::TensorInfo> m_inputInfos;
     std::vector<sharp::TensorInfo> m_outputInfos;
-    std::vector<std::vector<int64_t>> m_inputShapes;
-    std::vector<std::vector<int64_t>> m_outputShapes;
     // keep-raw mode: ORT-allocated outputs, indexed like the caller's outputs vector
     std::vector<std::unique_ptr<Ort::Value>> m_rawOutputs;
 };

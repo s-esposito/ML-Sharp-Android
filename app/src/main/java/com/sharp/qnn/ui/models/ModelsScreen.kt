@@ -254,17 +254,7 @@ class ModelsViewModel(app: Application) : AndroidViewModel(app) {
                     failCount = failCount
                 )
 
-                val result = withContext(Dispatchers.IO) {
-                    val initResult = kotlin.runCatching { sharpApp.pipelineManager.ensureQnnInitialized() }
-                    if (initResult.isFailure) {
-                        Result.failure(initResult.exceptionOrNull() ?: RuntimeException(MsgKey.ERR_QNN_INIT_DEFAULT))
-                    } else if (sharpApp.pipelineManager.isCpuBackend) {
-                        // DLC -> HTP context compilation is impossible on the CPU backend
-                        Result.failure(RuntimeException(MsgKey.ERR_NEEDS_NPU))
-                    } else {
-                        sharpApp.modelStore.compileModel(type)
-                    }
-                }
+                val result = withContext(Dispatchers.IO) { sharpApp.pipelineManager.compileDlc(type) }
 
                 if (_compileAllCancelled.get()) {
                     sharpApp.modelStore.cancelCompile(type)
@@ -329,17 +319,7 @@ class ModelsViewModel(app: Application) : AndroidViewModel(app) {
         _busy.value = type
         viewModelScope.launch {
             // nativeInit / compileDlc are blocking JNI calls (compilation can take tens of seconds); must run on the IO thread
-            val result = withContext(Dispatchers.IO) {
-                val initResult = kotlin.runCatching { sharpApp.pipelineManager.ensureQnnInitialized() }
-                if (initResult.isFailure) {
-                    Result.failure(initResult.exceptionOrNull() ?: RuntimeException(MsgKey.ERR_QNN_INIT_DEFAULT))
-                } else if (sharpApp.pipelineManager.isCpuBackend) {
-                    // DLC -> HTP context compilation is impossible on the CPU backend
-                    Result.failure(RuntimeException(MsgKey.ERR_NEEDS_NPU))
-                } else {
-                    sharpApp.modelStore.compileModel(type)
-                }
-            }
+            val result = withContext(Dispatchers.IO) { sharpApp.pipelineManager.compileDlc(type) }
             _message.value = if (result.isSuccess) MsgKey.k(MsgKey.MSG_COMPILE_OK, modelName(type))
             else MsgKey.k(MsgKey.ERR_COMPILE_FAIL, errorText(result.exceptionOrNull()))
             _busy.value = null

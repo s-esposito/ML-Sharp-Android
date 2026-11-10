@@ -41,6 +41,8 @@ ONNX_NAMES = {
     'rest_c': ['rest_c.onnx', 'rest_seg_c.onnx'],
 }
 PE_OUTS = ['patch_features', 'latent0', 'latent1']
+# PE patches dumped by the app (PipelineManager.DUMP_PATCHES): first x0 patch, centre x1 patch, x2
+DUMP_PATCHES = [0, 29, 34]
 MERGED = ['x_latent0', 'x_latent1', 'x0_feat', 'x1_feat', 'x2_feat', 'x_lowres_feat']
 
 RESULTS = []
@@ -77,6 +79,14 @@ def report(group, name, ref, got, min_cos):
     RESULTS.append((group, name, m, ok))
 
 
+def make_session(path, threads=0):
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if threads:
+        so.intra_op_num_threads = threads
+    return ort.InferenceSession(str(path), so, providers=['CPUExecutionProvider'])
+
+
 class Models:
     def __init__(self, onnx_dir, threads):
         self.dir = Path(onnx_dir)
@@ -94,12 +104,7 @@ class Models:
         # keep at most one session resident (encoders are 1.2 GB each)
         if key not in self.cache:
             self.cache.clear()
-            so = ort.SessionOptions()
-            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            if self.threads:
-                so.intra_op_num_threads = self.threads
-            self.cache[key] = ort.InferenceSession(str(self.path(key)), so,
-                                                   providers=['CPUExecutionProvider'])
+            self.cache[key] = make_session(self.path(key), self.threads)
         return self.cache[key]
 
     def run(self, key, feeds):
@@ -109,7 +114,7 @@ class Models:
         return dict(zip([o.name for o in s.get_outputs()], outs))
 
 
-def host(*args, capture=False):
+def host(*args):
     if not HOST_POST.exists():
         sys.exit(f"{HOST_POST} not built: run tools/host_post/build.sh")
     r = subprocess.run([str(HOST_POST), *map(str, args)], capture_output=True, text=True)
@@ -119,7 +124,7 @@ def host(*args, capture=False):
 
 
 def read_ply(path):
-    """Returns (vertex structured array, header text) for the app's binary PLY."""
+    """Vertex records (structured array) of the app's binary PLY."""
     with open(path, 'rb') as f:
         header = b''
         while not header.endswith(b'end_header\n'):
@@ -138,12 +143,12 @@ def read_ply(path):
             elif in_vertex and t[0] == 'property':
                 props.append((t[2], '<f4'))
         v = np.fromfile(f, dtype=np.dtype(props), count=n)
-    return v, text
+    return v
 
 
 def compare_ply(group, ref_path, got_path, min_cos):
-    ref, _ = read_ply(ref_path)
-    got, _ = read_ply(got_path)
+    ref = read_ply(ref_path)
+    got = read_ply(got_path)
     print(f"  [{group:8s}] gaussians ref={len(ref):,} device={len(got):,}"
           f"  {'ok' if len(ref) == len(got) else 'FAIL'}")
     RESULTS.append((group, 'gaussian_count', None, len(ref) == len(got)))
@@ -227,7 +232,7 @@ def compare_dump(dump, models, min_cos, keep):
         print(f"  HTP not used: {meta['fallback_reason']}")
 
     print("\n== per-model (device inputs -> desktop FP32 model) ==")
-    for p in meta.get('pe_patches', [0]):
+    for p in meta.get('pe_patches', DUMP_PATCHES):
         x = load_raw(dump / f'patch_p{p:04d}.raw', (1, 3, 384, 384))
         o = models.run('pe', {'patch_1': x})
         for k in PE_OUTS:
@@ -272,7 +277,7 @@ def make_reference(image, models, out):
     fpx, ow, oh = float(line.split()[0]), int(line.split()[1]), int(line.split()[2])
     t = run_desktop(models, out / 'image.raw', fpx, ow, oh, out)
     meta = {'backend': 'desktop-onnxruntime-fp32', 'threads': models.threads, 'fpx': fpx,
-            'orig_w': ow, 'orig_h': oh, 'device': 'desktop', 'soc': '', 'pe_patches': [0, 29, 34],
+            'orig_w': ow, 'orig_h': oh, 'device': 'desktop', 'soc': '', 'pe_patches': DUMP_PATCHES,
             'desktop_s': t}
     (out / 'meta.json').write_text(json.dumps(meta, indent=2))
     print(f"reference written to {out}: fpx={fpx:.2f} orig={ow}x{oh} timings={t}")

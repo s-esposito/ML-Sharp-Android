@@ -60,12 +60,8 @@ data class PipelineState(
     val isRunning: Boolean = false,
     val errorMessage: String? = null,
     val totalElapsedMs: Long = 0,
-    /** Active backend label (empty until initialized) */
-    val backendLabel: String = "",
     /** Peak RSS of the last completed run (MB, 0 = unknown) */
-    val peakRssMb: Long = 0,
-    /** One-line benchmark summary of the last completed run */
-    val benchSummary: String = ""
+    val peakRssMb: Long = 0
 ) {
     /** Whether every stage is complete */
     val isAllComplete: Boolean get() = stages.isNotEmpty() && stages.all { it.isComplete }
@@ -109,19 +105,24 @@ val DEFAULT_STAGES: List<StageState> = listOf(
     StageState(id = 8, name = "Point Cloud Generation", nameRes = R.string.stage_post, total = 5),
     StageState(id = 9, name = "PLY Optimization", nameRes = R.string.stage_ply_optimize, total = 1)
 )
+/** Inference backend family */
+enum class BackendKind { HTP, CPU }
+
 /**
  * Active inference backend.
- * @param name           "HTP", "ORT-CPU", "ORT-XNNPACK"
+ * @param kind           backend family (drives behaviour; [name] is display only)
+ * @param name           native label: "HTP", "ORT-CPU"
  * @param threads        CPU threads (0 for HTP)
  * @param fallbackReason why HTP was not used (null when HTP is active)
  */
 data class BackendInfo(
+    val kind: BackendKind,
     val name: String,
     val threads: Int,
     val fallbackReason: String?
 ) {
-    val isCpu: Boolean get() = name.startsWith("ORT")
+    val isCpu: Boolean get() = kind == BackendKind.CPU
 
-    /** Short UI label: "NPU (HTP)" / "CPU (ORT, 4 threads)" */
+    /** Short UI label: "NPU (HTP)" / "CPU (ONNX Runtime, N threads)" */
     val label: String get() = if (isCpu) "CPU (ONNX Runtime, $threads threads)" else "NPU (HTP)"
 }

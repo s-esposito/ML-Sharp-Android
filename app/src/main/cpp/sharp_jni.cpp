@@ -25,6 +25,11 @@
 // ONNX Runtime CPU fallback (non-HTP devices)
 #include "ort_runtime.h"
 #include "model_runtime.h"
+#include "proc_stats.h"
+
+using sharp::selfVmRSS_kB;
+using sharp::selfVmHWM_kB;
+static size_t readMemAvailableKB() { return sharp::memAvailable_kB(); }
 
 #include "QnnDevice.h"
 #include "QnnInterface.h"
@@ -63,7 +68,7 @@ enum class Backend { NONE, HTP, ORT };
 static Backend g_backend = Backend::NONE;
 // ORT runtimes per model slot (pe/ie/rest_a/rest_b/rest_c), created by nativeInitOrt
 static std::map<std::string, std::unique_ptr<ortrt::OrtRuntime>> g_ortRuntimes;
-static ortrt::OrtOptions g_ortOpts;
+static int g_ortThreads = 0;
 
 // HTP performance config: locked-corner mode (default, locked MAX) / adaptive mode (range + DCVS mode)
 // Takes effect only in nativeInit (when the shared backend/device is created); changes require a process restart
@@ -347,22 +352,9 @@ static sharp::ModelRuntime* rt(const std::string& modelType) {
     return runtimeFor(modelType).get();
 }
 
-// Peak RSS (VmHWM, kB) since process start or the last resetPeakRss
-static size_t selfVmHWM_kB() {
-    FILE* f = fopen("/proc/self/status", "r");
-    if (!f) return 0;
-    char line[256];
-    size_t v = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "VmHWM:", 6) == 0) { sscanf(line + 6, "%zu", &v); break; }
-    }
-    fclose(f);
-    return v;
-}
-
 // Number of "big" cores: cores whose max frequency is above the slowest cluster's
 // (A52s: 4x A78; falls back to 4 when cpufreq is unreadable)
-static int bigCoreCount() {
+static int bigCoreCountUncached() {
     std::vector<long> f;
     for (int c = 0; c < 16; c++) {
         char p[96];
@@ -380,6 +372,11 @@ static int bigCoreCount() {
     return n > 0 ? n : (int)f.size();
 }
 
+static int bigCoreCount() {
+    static const int n = bigCoreCountUncached();  // sysfs topology does not change at runtime
+    return n;
+}
+
 // Tensor name -> safe file name (replaces / with _)
 static std::string sanitizeTensorName(const std::string& name) {
     std::string r = name;
@@ -394,38 +391,6 @@ static std::string jstrToString(JNIEnv* env, jstring jstr) {
     std::string s(cstr);
     env->ReleaseStringUTFChars(jstr, cstr);
     return s;
-}
-
-// Current process RSS (kB) to attribute memory peaks to each inference stage (reads /proc/self/status)
-static size_t selfVmRSS_kB() {
-    FILE* f = fopen("/proc/self/status", "r");
-    if (!f) return 0;
-    char line[256];
-    size_t rss = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "VmRSS:", 6) == 0) {
-            sscanf(line + 6, "%zu", &rss);
-            break;
-        }
-    }
-    fclose(f);
-    return rss;
-}
-
-// Reads the device's available memory (kB) for adaptive cache sizing (reads /proc/meminfo)
-static size_t readMemAvailableKB() {
-    FILE* f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
-    char line[256];
-    size_t mem = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "MemAvailable:", 13) == 0) {
-            sscanf(line + 13, "%zu", &mem);
-            break;
-        }
-    }
-    fclose(f);
-    return mem;
 }
 
 // Computes the adaptive cache threshold and budget based on available device memory
@@ -449,6 +414,16 @@ static size_t adaptiveCacheBudget() {
     if (budget < 4 * 1024 * 1024) budget = 4 * 1024 * 1024;      // min 4MB
     if (budget > 32 * 1024 * 1024) budget = 32 * 1024 * 1024;    // max 32MB
     return budget;
+}
+
+// Pipeline state shared by both backends: REST cache sizing + SHARP core progress callback
+static void initCommonPipelineState() {
+    g_restCacheMaxBytes = adaptiveCacheThreshold();
+    g_restCacheTotalBudget = adaptiveCacheBudget();
+    LOGI("REST cache: threshold=%zuMB budget=%zuMB (available=%zuMB)",
+         g_restCacheMaxBytes / (1024*1024), g_restCacheTotalBudget / (1024*1024),
+         readMemAvailableKB() / 1024);
+    sharp_set_progress_callback(sharpProgressCallback);
 }
 
 // Checks and clears JNI exceptions (returns true if an exception was pending)
@@ -552,15 +527,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_nativeInit(JNIEnv* env, jobject thiz,
 
     g_dlcCompiler = std::make_unique<qnn::DlcCompiler>();
 
-    // Set REST cache parameters adaptively based on available device memory
-    g_restCacheMaxBytes = adaptiveCacheThreshold();
-    g_restCacheTotalBudget = adaptiveCacheBudget();
-    LOGI("REST cache: threshold=%zuMB budget=%zuMB (available=%zuMB)",
-         g_restCacheMaxBytes / (1024*1024), g_restCacheTotalBudget / (1024*1024),
-         readMemAvailableKB() / 1024);
-
-    // Register the SHARP core progress callback
-    sharp_set_progress_callback(sharpProgressCallback);
+    initCommonPipelineState();
 
     g_qnnInitialized = true;
     g_backend = Backend::HTP;
@@ -1167,24 +1134,24 @@ static bool runRestInference(sharp::ModelRuntime* rt,
                 releaseUnwritten(j);
                 return false;
             }
-            std::vector<float> tmp(std::min(CHUNK, outputs[j].count));
-            size_t done = 0;
-            while (done < outputs[j].count) {
-                size_t n = std::min(CHUNK, outputs[j].count - done);
-                if (oinfo->dataType == QNN_DATATYPE_UFIXED_POINT_16) {
-                    qnn::ufixed16ToFloat(
-                        reinterpret_cast<const uint16_t*>(raw) + done,
-                        tmp.data(), n, oinfo->scale, oinfo->offset);
-                } else if (oinfo->dataType == QNN_DATATYPE_UFIXED_POINT_8) {
-                    qnn::ufixed8ToFloat(raw + done, tmp.data(), n,
-                                        oinfo->scale, oinfo->offset);
-                } else {
-                    // float32 copied directly
-                    std::memcpy(tmp.data(), reinterpret_cast<const float*>(raw) + done,
-                                n * sizeof(float));
+            if (oinfo->dataType == QNN_DATATYPE_FLOAT_32) {
+                // float32 (ORT / FP32 DLC) is already in file format: write as-is, no scratch copy
+                f.write(reinterpret_cast<const char*>(raw), outputs[j].count * sizeof(float));
+            } else {
+                std::vector<float> tmp(std::min(CHUNK, outputs[j].count));
+                for (size_t done = 0; done < outputs[j].count; ) {
+                    size_t n = std::min(CHUNK, outputs[j].count - done);
+                    if (oinfo->dataType == QNN_DATATYPE_UFIXED_POINT_16) {
+                        qnn::ufixed16ToFloat(reinterpret_cast<const uint16_t*>(raw) + done,
+                                             tmp.data(), n, oinfo->scale, oinfo->offset);
+                    } else if (oinfo->dataType == QNN_DATATYPE_UFIXED_POINT_8) {
+                        qnn::ufixed8ToFloat(raw + done, tmp.data(), n, oinfo->scale, oinfo->offset);
+                    } else {  // QNN_DATATYPE_FLOAT_16
+                        qnn::float16ToFloat32(reinterpret_cast<const uint16_t*>(raw) + done, tmp.data(), n);
+                    }
+                    f.write(reinterpret_cast<const char*>(tmp.data()), n * sizeof(float));
+                    done += n;
                 }
-                f.write(reinterpret_cast<const char*>(tmp.data()), n * sizeof(float));
-                done += n;
             }
         }
 
@@ -1202,20 +1169,23 @@ static bool runRestInference(sharp::ModelRuntime* rt,
 static bool copyNamedOutput(sharp::ModelRuntime* r, const std::string& outDir,
                             const std::string& key, const std::string& dst) {
     if (!r) return false;
-    for (const auto& out : r->getOutputInfos()) {
-        if (out.name == key || out.name.find(key) != std::string::npos) {
-            std::string src = outDir + "/" + sanitizeTensorName(out.name) + ".raw";
-            std::ifstream srcF(src, std::ios::binary);
-            std::ofstream dstF(dst, std::ios::binary);
-            if (!srcF || !dstF) {
-                LOGE("copy %s -> %s failed", src.c_str(), dst.c_str());
-                return false;
-            }
-            dstF << srcF.rdbuf();
-            return true;
-        }
+    const auto& outs = r->getOutputInfos();
+    // Exact name first; substring only as a fallback (graph-internal names may contain the key)
+    const sharp::TensorInfo* match = nullptr;
+    for (const auto& o : outs) if (o.name == key) { match = &o; break; }
+    if (!match)
+        for (const auto& o : outs) if (o.name.find(key) != std::string::npos) { match = &o; break; }
+    if (!match) return false;
+
+    std::string src = outDir + "/" + sanitizeTensorName(match->name) + ".raw";
+    std::ifstream srcF(src, std::ios::binary);
+    std::ofstream dstF(dst, std::ios::binary);
+    if (!srcF || !dstF) {
+        LOGE("copy %s -> %s failed", src.c_str(), dst.c_str());
+        return false;
     }
-    return false;
+    dstF << srcF.rdbuf();
+    return true;
 }
 
 // REST Seg A: feature fusion
@@ -1262,10 +1232,12 @@ Java_com_sharp_qnn_pipeline_QnnJni_runRestSegB(JNIEnv* env, jobject thiz, jstrin
     }
 
     // Copy the disparity output to workDir/disparity.raw (used by Seg C and Post).
-    // Splits differ by export: upstream's DLCs and the auto-cut ONNX emit it from
-    // seg B; if a split emits it from seg C instead, runRestSegC copies it there.
+    // Contract: seg B emits `disparity` (upstream DLCs, and build_rest_pipeline.py's
+    // auto cuts end seg B right after the node producing it).
     if (!copyNamedOutput(rt("rest_b"), outDir, "disparity", workDir + "/disparity.raw")) {
-        LOGI("runRestSegB: no disparity output in seg B (expected from seg C)");
+        LOGE("disparity output tensor not found");
+        cbError(6, "err_disparity_output_missing");
+        return JNI_FALSE;
     }
 
     LOGI("runRestSegB exit RSS=%zuKB", selfVmRSS_kB());
@@ -1303,20 +1275,11 @@ Java_com_sharp_qnn_pipeline_QnnJni_runRestSegC(JNIEnv* env, jobject thiz,
         return JNI_FALSE;
     }
 
-    // Copy delta (and disparity, if this split emits it from seg C) for Post
+    // Copy delta for Post
     if (!copyNamedOutput(rt("rest_c"), outDir, "delta", workDir + "/delta.raw")) {
         LOGE("delta output tensor not found");
         cbError(7, "err_delta_output_missing");
         return JNI_FALSE;
-    }
-    copyNamedOutput(rt("rest_c"), outDir, "disparity", workDir + "/disparity.raw");
-    {
-        std::ifstream chk(workDir + "/disparity.raw", std::ios::binary);
-        if (!chk) {
-            LOGE("disparity output tensor not found in seg B or C");
-            cbError(7, "err_disparity_output_missing");
-            return JNI_FALSE;
-        }
     }
 
     // Clear the REST cache (the pipeline inference is complete)
@@ -1730,26 +1693,15 @@ Java_com_sharp_qnn_pipeline_QnnJni_runAnyCalib(JNIEnv* env, jobject thiz,
 // Initialises the ORT runtimes for the 5 core slots and makes ORT the active backend.
 // threads <= 0: use the big-core count. Returns true on success.
 JNIEXPORT jboolean JNICALL
-Java_com_sharp_qnn_pipeline_QnnJni_nativeInitOrt(JNIEnv* env, jobject thiz,
-                                                 jint jThreads, jboolean jXnnpack) {
+Java_com_sharp_qnn_pipeline_QnnJni_nativeInitOrt(JNIEnv* env, jobject thiz, jint jThreads) {
     std::lock_guard<std::mutex> lock(g_initMutex);
-    g_ortOpts.intraOpThreads = jThreads > 0 ? (int)jThreads : bigCoreCount();
-    g_ortOpts.useXnnpack = jXnnpack == JNI_TRUE;
+    g_ortThreads = jThreads > 0 ? (int)jThreads : bigCoreCount();
     g_ortRuntimes.clear();
-    for (const char* t : {"pe", "ie", "rest_a", "rest_b", "rest_c"}) {
-        auto r = std::make_unique<ortrt::OrtRuntime>();
-        if (r->init(g_ortOpts) != 0) {
-            LOGE("nativeInitOrt: init failed for %s", t);
-            g_ortRuntimes.clear();
-            return JNI_FALSE;
-        }
-        g_ortRuntimes[t] = std::move(r);
-    }
-    g_restCacheMaxBytes = adaptiveCacheThreshold();
-    g_restCacheTotalBudget = adaptiveCacheBudget();
-    sharp_set_progress_callback(sharpProgressCallback);
+    for (const char* t : {"pe", "ie", "rest_a", "rest_b", "rest_c"})
+        g_ortRuntimes[t] = std::make_unique<ortrt::OrtRuntime>(g_ortThreads);
+    initCommonPipelineState();
     g_backend = Backend::ORT;
-    LOGI("nativeInitOrt OK: threads=%d xnnpack=%d", g_ortOpts.intraOpThreads, (int)g_ortOpts.useXnnpack);
+    LOGI("nativeInitOrt OK: threads=%d", g_ortThreads);
     return JNI_TRUE;
 }
 
@@ -1765,7 +1717,8 @@ Java_com_sharp_qnn_pipeline_QnnJni_loadOnnxModel(JNIEnv* env, jobject thiz,
         return JNI_FALSE;
     }
     LOGI("loadOnnxModel: type=%s path=%s RSS=%zuKB", modelType.c_str(), path.c_str(), selfVmRSS_kB());
-    int r = it->second->load(path);
+    // Arena only for PE (35 runs); single-run models give memory back as outputs stream out
+    int r = it->second->load(path, /*useArena=*/modelType == "pe");
     if (r != 0) {
         LOGE("loadOnnxModel failed: %d", r);
         return JNI_FALSE;
@@ -1773,19 +1726,17 @@ Java_com_sharp_qnn_pipeline_QnnJni_loadOnnxModel(JNIEnv* env, jobject thiz,
     return JNI_TRUE;
 }
 
-// Active backend label: "HTP", "ORT-CPU", "ORT-XNNPACK" or "" when none is initialised
+// Active backend label ("HTP", "ORT-CPU"), or "" when none is initialised
 JNIEXPORT jstring JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_getBackendName(JNIEnv* env, jobject thiz) {
-    const char* n = "";
-    if (g_backend == Backend::HTP) n = "HTP";
-    else if (g_backend == Backend::ORT) n = g_ortOpts.useXnnpack ? "ORT-XNNPACK" : "ORT-CPU";
-    return env->NewStringUTF(n);
+    sharp::ModelRuntime* r = g_backend == Backend::NONE ? nullptr : rt("pe");
+    return env->NewStringUTF(r ? r->backendName() : "");
 }
 
 // Thread count the ORT backend uses (0 when ORT is not active)
 JNIEXPORT jint JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_getOrtThreads(JNIEnv* env, jobject thiz) {
-    return g_backend == Backend::ORT ? g_ortOpts.intraOpThreads : 0;
+    return g_backend == Backend::ORT ? g_ortThreads : 0;
 }
 
 JNIEXPORT jint JNICALL
@@ -1797,12 +1748,6 @@ Java_com_sharp_qnn_pipeline_QnnJni_defaultThreadCount(JNIEnv* env, jobject thiz)
 JNIEXPORT jlong JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_getPeakRssKb(JNIEnv* env, jobject thiz) {
     return (jlong)selfVmHWM_kB();
-}
-
-// Current RSS in kB
-JNIEXPORT jlong JNICALL
-Java_com_sharp_qnn_pipeline_QnnJni_getRssKb(JNIEnv* env, jobject thiz) {
-    return (jlong)selfVmRSS_kB();
 }
 
 // Resets VmHWM to the current RSS (writes "5" to /proc/self/clear_refs)

@@ -34,3 +34,4 @@ output/
 *.raw
 *.ply
 dumps/
+__pycache__/

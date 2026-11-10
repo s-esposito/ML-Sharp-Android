@@ -63,7 +63,10 @@ N_CALIB = 20
 # apple/ml-sharp checkout (src/ + checkpoint). Defaults to this script's dir for
 # backward compat; override with --sharp_root or the SHARP_ROOT env var.
 SHARP_ROOT = Path(os.environ.get('SHARP_ROOT', PROJECT)).resolve()
-WEIGHTS = SHARP_ROOT / 'sharp_2572gikvuh.pt'
+
+
+def weights_path():
+    return SHARP_ROOT / 'sharp_2572gikvuh.pt'
 
 FORMAT_MAP = {
     'int16': {'w': 16, 'a': 16},
@@ -193,7 +196,7 @@ def _load_predictor():
         fail(f"加载 sharp 模型库失败: {e}\n请先安装项目依赖: pip install -r requirements.txt\n"
         f"Failed to load sharp model library: {e}\nInstall project dependencies: pip install -r requirements.txt")
     predictor = create_predictor(PredictorParams())
-    sd = torch.load(WEIGHTS, map_location='cpu', weights_only=False)
+    sd = torch.load(weights_path(), map_location='cpu', weights_only=False)
     predictor.load_state_dict(sd, strict=False)
     predictor.eval()
     return predictor
@@ -406,9 +409,9 @@ def export_onnx(scope, out_dir):
     _require_py('onnxsim')
     _require_src()
     import torch
-    if not WEIGHTS.exists():
-        fail(f"缺少权重文件: {WEIGHTS}\n请将 sharp_2572gikvuh.pt 放在项目根目录\n"
-        f"Missing weights: {WEIGHTS}\nPlace sharp_2572gikvuh.pt in the project root")
+    if not weights_path().exists():
+        fail(f"缺少权重文件: {weights_path()}\n请将 sharp_2572gikvuh.pt 放在 --sharp_root 目录\n"
+        f"Missing weights: {weights_path()}\nPlace sharp_2572gikvuh.pt in the --sharp_root directory")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     wants_pe = scope in ('all', 'pe')
@@ -496,6 +499,10 @@ def split_rest(out_dir):
         start = 0 if i == 0 else CUTS[i-1]
         segments.append(nodes[start:cut])
     segments.append(nodes[CUTS[-1]:])
+    # App contract (sharp_jni.cpp runRestSegB): seg B emits `disparity`
+    if not any('disparity' in n.output for n in segments[1]):
+        fail(f"cuts {CUTS}: 'disparity' is not produced in rest_seg_b (the app requires it) / "
+             f"cuts {CUTS}: 'disparity' 不在 rest_seg_b 中产生")
 
     seg_names = ['rest_seg_a', 'rest_seg_b', 'rest_seg_c']
     # DLC 最终输出名 / DLC final output names
@@ -1464,13 +1471,11 @@ def main():
     parser.add_argument('--cuts', default=None, metavar='<a,b>',
                         help='rest split node indices, e.g. 52,84 (default: auto)')
     args = parser.parse_args()
-    if args.cuts:
-        global CUTS
-        CUTS = [int(x) for x in args.cuts.split(',')]
+    global SHARP_ROOT, CUTS
     if args.sharp_root:
-        global SHARP_ROOT, WEIGHTS
         SHARP_ROOT = Path(args.sharp_root).expanduser().resolve()
-        WEIGHTS = SHARP_ROOT / 'sharp_2572gikvuh.pt'
+    if args.cuts:
+        CUTS = [int(x) for x in args.cuts.split(',')]
 
     if args.task not in ('onnx', 'dlc', 'calib'):
         fail(f"未知任务: {args.task} (可选: onnx / dlc / calib) / "

@@ -154,23 +154,20 @@ public:
     // outputs: output tensor array (out; the caller allocates `data`;
     //           with keepOutputQuantized=true, data may be null and results stay in the internal quantized buffer)
     // keepOutputQuantized: when true, outputs are not dequantized; raw quantized data stays in an internal buffer,
-    //                      read via getQuantizedOutputData() and released via releaseQuantizedOutput()
+    //                      read via getRawOutputData() and released via releaseRawOutput()
     // Returns 0 on success
     int execute(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs,
                 bool keepOutputQuantized = false) override;
 
-    // ModelRuntime raw-output accessors (raw = native dtype: uint16/uint8 quantised, fp16 or fp32)
-    const uint8_t* getRawOutputData(size_t i) const override { return getQuantizedOutputData(i); }
-    void releaseRawOutput(size_t i) override { releaseQuantizedOutput(i); }
-
-    // Reads the raw quantized data of output i in keepOutputQuantized mode (byte pointer)
-    const uint8_t* getQuantizedOutputData(size_t i) const {
+    // Raw output of output i in keepOutputQuantized mode, in its native dtype
+    // (uint16/uint8 quantised, fp16, or fp32 when the caller passed no buffer)
+    const uint8_t* getRawOutputData(size_t i) const override {
         return (i < m_outQuantBuf.size() && !m_outQuantBuf[i].empty())
                    ? m_outQuantBuf[i].data() : nullptr;
     }
 
-    // Releases the quantized buffer of output i (call after persisting, lowers the write-phase memory footprint)
-    void releaseQuantizedOutput(size_t i) {
+    // Releases output i's raw buffer (call after persisting, lowers the write-phase memory footprint)
+    void releaseRawOutput(size_t i) override {
         if (i < m_outQuantBuf.size()) m_outQuantBuf[i].clear();
     }
 

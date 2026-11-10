@@ -115,21 +115,26 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     /** Active inference backend (null until the first run initializes it) */
     val backendFlow = sharpApp.pipelineManager.backend
 
-    /** Default ORT thread count (big cores) shown for "Auto" */
-    val defaultThreads: Int = runCatching { QnnJni.defaultThreadCount() }.getOrDefault(4)
+    /** Default ORT thread count (big cores) shown for "Auto"; cached natively after first read */
+    val defaultThreads: Int by lazy { runCatching { QnnJni.defaultThreadCount() }.getOrDefault(4) }
 
-    /** Backend override; the native backend is torn down so the next run re-probes */
+    /** Backend override; on change the backend is re-probed at the next run */
     fun setBackendOverride(o: SettingsRepository.BackendOverride) {
         viewModelScope.launch {
-            sharpApp.settingsRepository.setBackendOverride(o)
-            sharpApp.pipelineManager.reinitBackend()
+            val repo = sharpApp.settingsRepository
+            if (repo.settingsFlow.first().backendOverride == o) return@launch
+            repo.setBackendOverride(o)
+            sharpApp.pipelineManager.invalidateBackend()
         }
     }
 
+    /** CPU thread count; only the CPU backend uses it, so HTP is not re-probed for it */
     fun setCpuThreads(n: Int) {
         viewModelScope.launch {
-            sharpApp.settingsRepository.setCpuThreads(n)
-            sharpApp.pipelineManager.reinitBackend()
+            val repo = sharpApp.settingsRepository
+            if (repo.settingsFlow.first().cpuThreads == n) return@launch
+            repo.setCpuThreads(n)
+            if (sharpApp.pipelineManager.isCpuBackend) sharpApp.pipelineManager.invalidateBackend()
         }
     }
 
@@ -293,7 +298,6 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val settings by vm.settingsFlow.collectAsState(initial = SettingsRepository.DEFAULTS)
@@ -589,32 +593,24 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        SettingsRepository.BackendOverride.entries.forEach { o ->
-                            FilterChip(
-                                selected = settings.backendOverride == o,
-                                onClick = { vm.setBackendOverride(o) },
-                                label = {
-                                    Text(stringResource(when (o) {
-                                        SettingsRepository.BackendOverride.AUTO -> R.string.settings_backend_auto
-                                        SettingsRepository.BackendOverride.HTP -> R.string.settings_backend_htp
-                                        SettingsRepository.BackendOverride.CPU -> R.string.settings_backend_cpu
-                                    }))
-                                }
-                            )
-                        }
+                    ChoiceChips(
+                        options = SettingsRepository.BackendOverride.entries,
+                        selected = settings.backendOverride,
+                        onSelect = vm::setBackendOverride
+                    ) { o ->
+                        stringResource(when (o) {
+                            SettingsRepository.BackendOverride.AUTO -> R.string.settings_backend_auto
+                            SettingsRepository.BackendOverride.HTP -> R.string.settings_backend_htp
+                            SettingsRepository.BackendOverride.CPU -> R.string.settings_backend_cpu
+                        })
                     }
                     Text(stringResource(R.string.settings_cpu_threads), style = MaterialTheme.typography.bodyMedium)
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(0, 1, 2, 4, 6, 8).forEach { n ->
-                            FilterChip(
-                                selected = settings.cpuThreads == n,
-                                onClick = { vm.setCpuThreads(n) },
-                                label = {
-                                    Text(if (n == 0) stringResource(R.string.settings_cpu_threads_auto, vm.defaultThreads) else n.toString())
-                                }
-                            )
-                        }
+                    ChoiceChips(
+                        options = CPU_THREAD_CHOICES,
+                        selected = settings.cpuThreads,
+                        onSelect = vm::setCpuThreads
+                    ) { n ->
+                        if (n == 0) stringResource(R.string.settings_cpu_threads_auto, vm.defaultThreads) else n.toString()
                     }
                     Text(
                         text = backend?.let { stringResource(R.string.settings_backend_active, it.label) }
@@ -1047,6 +1043,33 @@ private fun DownloadSourcePanel(
                         }
                     )
                 }
+            )
+        }
+    }
+}
+
+/** CPU thread choices in the backend card (0 = auto / big-core count) */
+private val CPU_THREAD_CHOICES = listOf(0, 1, 2, 4, 6, 8)
+
+/** Single-choice FilterChip row with haptics (same pattern as [LanguagePanel]); wraps on narrow screens */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun <T> ChoiceChips(
+    options: List<T>,
+    selected: T,
+    onSelect: (T) -> Unit,
+    label: @Composable (T) -> String
+) {
+    val haptic = LocalHapticFeedback.current
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        options.forEach { o ->
+            FilterChip(
+                selected = selected == o,
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSelect(o)
+                },
+                label = { Text(label(o)) }
             )
         }
     }

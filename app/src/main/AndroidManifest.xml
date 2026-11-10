@@ -33,7 +33,10 @@
         tools:targetApi="34">
 
         <!-- QNN HTP 依赖的 vendor 共享库 (Android 11+ linker namespace 隔离需要声明) -->
-        <uses-native-library android:name="libcdsprpc.so" android:required="true" />
+        <!-- Vendor lib needed by QNN HTP (must be declared for the Android 11+ linker namespace).
+             required="false": still exposed to the app on Qualcomm devices, but the APK can
+             also install on non-Qualcomm SoCs (Exynos/MediaTek), which use the CPU fallback. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
 
         <activity
             android:name=".MainActivity"

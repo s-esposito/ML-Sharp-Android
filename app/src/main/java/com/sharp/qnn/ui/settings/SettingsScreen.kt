@@ -85,6 +85,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.sharp.qnn.R
+import com.sharp.qnn.pipeline.QnnJni
 import com.sharp.qnn.SHARPApplication
 import com.sharp.qnn.data.SettingsRepository
 import com.sharp.qnn.data.SettingsRepository.DownloadSource
@@ -110,6 +111,31 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     private val sharpApp = app as SHARPApplication
 
     val settingsFlow = sharpApp.settingsRepository.settingsFlow
+
+    /** Active inference backend (null until the first run initializes it) */
+    val backendFlow = sharpApp.pipelineManager.backend
+
+    /** Default ORT thread count (big cores) shown for "Auto" */
+    val defaultThreads: Int = runCatching { QnnJni.defaultThreadCount() }.getOrDefault(4)
+
+    /** Backend override; the native backend is torn down so the next run re-probes */
+    fun setBackendOverride(o: SettingsRepository.BackendOverride) {
+        viewModelScope.launch {
+            sharpApp.settingsRepository.setBackendOverride(o)
+            sharpApp.pipelineManager.reinitBackend()
+        }
+    }
+
+    fun setCpuThreads(n: Int) {
+        viewModelScope.launch {
+            sharpApp.settingsRepository.setCpuThreads(n)
+            sharpApp.pipelineManager.reinitBackend()
+        }
+    }
+
+    fun setDumpTensors(enable: Boolean) {
+        viewModelScope.launch { sharpApp.settingsRepository.setDumpTensors(enable) }
+    }
 
     fun setPlySaveLocation(uriString: String) {
         viewModelScope.launch { sharpApp.settingsRepository.setPlySaveLocation(uriString) }
@@ -267,6 +293,7 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
     val settings by vm.settingsFlow.collectAsState(initial = SettingsRepository.DEFAULTS)
@@ -543,6 +570,75 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                 description = stringResource(R.string.settings_logging_desc),
                 checked = settings.logRecording,
                 onCheckedChange = { vm.setLogRecording(it) }
+            )
+        }
+
+        // ====== Inference backend (developer) ======
+        item {
+            val backend by vm.backendFlow.collectAsState()
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.fillMaxWidth().padding(Spacing.lg), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                    Text(stringResource(R.string.settings_backend), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = stringResource(R.string.settings_backend_desc),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SettingsRepository.BackendOverride.entries.forEach { o ->
+                            FilterChip(
+                                selected = settings.backendOverride == o,
+                                onClick = { vm.setBackendOverride(o) },
+                                label = {
+                                    Text(stringResource(when (o) {
+                                        SettingsRepository.BackendOverride.AUTO -> R.string.settings_backend_auto
+                                        SettingsRepository.BackendOverride.HTP -> R.string.settings_backend_htp
+                                        SettingsRepository.BackendOverride.CPU -> R.string.settings_backend_cpu
+                                    }))
+                                }
+                            )
+                        }
+                    }
+                    Text(stringResource(R.string.settings_cpu_threads), style = MaterialTheme.typography.bodyMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        listOf(0, 1, 2, 4, 6, 8).forEach { n ->
+                            FilterChip(
+                                selected = settings.cpuThreads == n,
+                                onClick = { vm.setCpuThreads(n) },
+                                label = {
+                                    Text(if (n == 0) stringResource(R.string.settings_cpu_threads_auto, vm.defaultThreads) else n.toString())
+                                }
+                            )
+                        }
+                    }
+                    Text(
+                        text = backend?.let { stringResource(R.string.settings_backend_active, it.label) }
+                            ?: stringResource(R.string.settings_backend_none),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    backend?.fallbackReason?.let {
+                        Text(
+                            text = stringResource(R.string.settings_backend_fallback, it),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            SwitchSettingRow(
+                title = stringResource(R.string.settings_dump_tensors),
+                description = stringResource(R.string.settings_dump_tensors_desc),
+                checked = settings.dumpTensors,
+                onCheckedChange = { vm.setDumpTensors(it) }
             )
         }
 

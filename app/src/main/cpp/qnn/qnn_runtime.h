@@ -11,6 +11,7 @@
 #include "QnnInterface.h"
 #include "System/QnnSystemInterface.h"
 #include "HTP/QnnHtpDevice.h"
+#include "model_runtime.h"
 
 namespace qnn {
 
@@ -24,16 +25,8 @@ enum class HtpArch {
     V81 = 81
 };
 
-// Inference input/output tensor
-struct Tensor {
-    std::string name;
-    std::vector<uint32_t> dims;    // dims (NHWC or NCHW, model-dependent)
-    float* data;                   // uint8)
-                                   // data pointer: float32 by default; raw quantized bytes (uint16/uint8) when quantized=true
-    size_t count;                  // element count
-    bool quantized;                // 模型 info)
-                                   // data points to raw quantized data (uint16/uint8, per dims/model info)
-};
+// Tensor / TensorInfo are shared with the other runtimes (runtime/model_runtime.h)
+using Tensor = sharp::Tensor;
 
 // Progress callback
 using ProgressCallback = void (*)(int current, int total, long elapsedMs, const char* detail);
@@ -129,11 +122,16 @@ struct QnnSharedState {
 };
 
 // QNN HTP runtime
-class HtpRuntime {
+class HtpRuntime : public sharp::ModelRuntime {
 public:
+    using TensorInfo = sharp::TensorInfo;
+
     // shared: process-wide QnnSharedState (owned by the caller, outlives every runtime)
     explicit HtpRuntime(QnnSharedState* shared);
-    ~HtpRuntime();
+    ~HtpRuntime() override;
+
+    const char* backendName() const override { return "HTP"; }
+    bool hasModel() const override { return m_graphHandle != nullptr; }
 
     // init: if the shared state does not exist yet, dlopen libQnnHtp.so + libQnnSystem.so,
     // create log/backend/device + HTP performance config; then bump the refcount
@@ -159,7 +157,11 @@ public:
     //                      read via getQuantizedOutputData() and released via releaseQuantizedOutput()
     // Returns 0 on success
     int execute(const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs,
-                bool keepOutputQuantized = false);
+                bool keepOutputQuantized = false) override;
+
+    // ModelRuntime raw-output accessors (raw = native dtype: uint16/uint8 quantised, fp16 or fp32)
+    const uint8_t* getRawOutputData(size_t i) const override { return getQuantizedOutputData(i); }
+    void releaseRawOutput(size_t i) override { releaseQuantizedOutput(i); }
 
     // Reads the raw quantized data of output i in keepOutputQuantized mode (byte pointer)
     const uint8_t* getQuantizedOutputData(size_t i) const {
@@ -173,7 +175,7 @@ public:
     }
 
     // Frees this runtime's context+graph (shared device/backend/log stay alive for other runtimes)
-    void freeGraph();
+    void freeGraph() override;
 
     // Frees this runtime's context+graph and releases the shared-state reference
     // device/log 在最后一个引用释放时销毁)
@@ -181,21 +183,12 @@ public:
     void freeContext();
 
     // Whether initialized
-    bool isReady() const { return m_ready; }
+    bool isReady() const override { return m_ready; }
 
     // Gets input/output tensor metadata (dims, dataType, quantParams)
     // Read from the binary metadata, available after loadFromBinary
-    struct TensorInfo {
-        std::string name;
-        std::vector<uint32_t> dims;
-        uint32_t dataType;       // QNN_DATATYPE_*
-        float scale;             // quantization scale
-        int32_t offset;          // quantization offset
-        uint32_t quantEncoding;  // raw quantization encoding
-        uint32_t bitwidth;       // BW_SCALE_OFFSET bitwidth (16 or 8)
-    };
-    const std::vector<TensorInfo>& getInputInfos() const { return m_inputInfos; }
-    const std::vector<TensorInfo>& getOutputInfos() const { return m_outputInfos; }
+    const std::vector<TensorInfo>& getInputInfos() const override { return m_inputInfos; }
+    const std::vector<TensorInfo>& getOutputInfos() const override { return m_outputInfos; }
 
     friend class DlcCompiler;
 

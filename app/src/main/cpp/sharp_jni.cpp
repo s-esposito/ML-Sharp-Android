@@ -22,6 +22,9 @@
 #include "qnn_runtime.h"
 #include "qnn_dlc_compiler.h"
 #include "qnn_tensor.h"
+// ONNX Runtime CPU fallback (non-HTP devices)
+#include "ort_runtime.h"
+#include "model_runtime.h"
 
 #include "QnnDevice.h"
 #include "QnnInterface.h"
@@ -55,6 +58,13 @@ static std::unique_ptr<qnn::HtpRuntime> g_anycalibRuntime;
 static std::unique_ptr<qnn::DlcCompiler> g_dlcCompiler;
 static bool g_qnnInitialized = false;
 
+// ====== Backend selection (Phase 1: HTP preferred, ORT CPU fallback) ======
+enum class Backend { NONE, HTP, ORT };
+static Backend g_backend = Backend::NONE;
+// ORT runtimes per model slot (pe/ie/rest_a/rest_b/rest_c), created by nativeInitOrt
+static std::map<std::string, std::unique_ptr<ortrt::OrtRuntime>> g_ortRuntimes;
+static ortrt::OrtOptions g_ortOpts;
+
 // HTP performance config: locked-corner mode (default, locked MAX) / adaptive mode (range + DCVS mode)
 // Takes effect only in nativeInit (when the shared backend/device is created); changes require a process restart
 static qnn::PerfConfig g_perfCfg;
@@ -72,7 +82,7 @@ static size_t g_restCacheBytes = 0;
 // on budget overflow the whole cache is cleared (prefer files over an uncontrolled memory peak)
 // data holds raw quantized values (uint16/uint8); small tensors are dequantized and cached as float
 static void restCachePut(const std::string& name, const void* raw,
-                         size_t count, const qnn::HtpRuntime::TensorInfo* oinfo) {
+                         size_t count, const sharp::TensorInfo* oinfo) {
     size_t bytes = count * sizeof(float);
     if (bytes >= g_restCacheMaxBytes) return;
     if (g_restCacheBytes + bytes > g_restCacheTotalBudget) {
@@ -328,6 +338,48 @@ static std::unique_ptr<qnn::HtpRuntime>& runtimeFor(const std::string& modelType
     return g_peRuntime; // default
 }
 
+// Active runtime for a model slot (HTP or ORT, per g_backend); nullptr if unavailable
+static sharp::ModelRuntime* rt(const std::string& modelType) {
+    if (g_backend == Backend::ORT) {
+        auto it = g_ortRuntimes.find(modelType);
+        return it == g_ortRuntimes.end() ? nullptr : it->second.get();
+    }
+    return runtimeFor(modelType).get();
+}
+
+// Peak RSS (VmHWM, kB) since process start or the last resetPeakRss
+static size_t selfVmHWM_kB() {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmHWM:", 6) == 0) { sscanf(line + 6, "%zu", &v); break; }
+    }
+    fclose(f);
+    return v;
+}
+
+// Number of "big" cores: cores whose max frequency is above the slowest cluster's
+// (A52s: 4x A78; falls back to 4 when cpufreq is unreadable)
+static int bigCoreCount() {
+    std::vector<long> f;
+    for (int c = 0; c < 16; c++) {
+        char p[96];
+        snprintf(p, sizeof(p), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE* fp = fopen(p, "r");
+        if (!fp) break;
+        long v = 0;
+        if (fscanf(fp, "%ld", &v) == 1) f.push_back(v);
+        fclose(fp);
+    }
+    if (f.empty()) return 4;
+    long mn = *std::min_element(f.begin(), f.end());
+    int n = 0;
+    for (long v : f) if (v > mn) n++;
+    return n > 0 ? n : (int)f.size();
+}
+
 // Tensor name -> safe file name (replaces / with _)
 static std::string sanitizeTensorName(const std::string& name) {
     std::string r = name;
@@ -511,6 +563,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_nativeInit(JNIEnv* env, jobject thiz,
     sharp_set_progress_callback(sharpProgressCallback);
 
     g_qnnInitialized = true;
+    g_backend = Backend::HTP;
     LOGI("QNN runtime init OK (5 runtimes)");
     return JNI_TRUE;
 }
@@ -547,6 +600,13 @@ JNIEXPORT void JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_nativeDestroy(JNIEnv* env, jobject thiz) {
     std::lock_guard<std::mutex> lock(g_initMutex);
 
+    // ORT runtimes (CPU fallback) are independent of the QNN shared state
+    if (!g_ortRuntimes.empty()) {
+        g_ortRuntimes.clear();
+        LOGI("ORT runtimes destroyed");
+    }
+    if (g_backend == Backend::ORT) g_backend = Backend::NONE;
+
     // Skip when not initialized to avoid double teardown
     if (!g_qnnInitialized) {
         LOGI("nativeDestroy: not initialized, skip");
@@ -567,6 +627,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_nativeDestroy(JNIEnv* env, jobject thiz) {
         g_callbackObj = nullptr;
     }
     g_qnnInitialized = false;
+    g_backend = Backend::NONE;
     LOGI("QNN runtime destroyed");
 }
 
@@ -686,7 +747,8 @@ JNIEXPORT jboolean JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_runPatchEncoder(JNIEnv* env, jobject thiz, jstring jWorkDir) {
     std::string workDir = jstrToString(env, jWorkDir);
 
-    if (!g_peRuntime || !g_peRuntime->isReady()) {
+    sharp::ModelRuntime* peRt = rt("pe");
+    if (!peRt || !peRt->isReady() || !peRt->hasModel()) {
         LOGE("PE runtime not ready");
         cbError(2, "err_pe_not_loaded");
         return JNI_FALSE;
@@ -700,8 +762,8 @@ Java_com_sharp_qnn_pipeline_QnnJni_runPatchEncoder(JNIEnv* env, jobject thiz, js
     ensureDir(outDir);
 
     const int NUM_PATCHES = 35;
-    const auto& inputInfos = g_peRuntime->getInputInfos();
-    const auto& outputInfos = g_peRuntime->getOutputInfos();
+    const auto& inputInfos = peRt->getInputInfos();
+    const auto& outputInfos = peRt->getOutputInfos();
 
     if (inputInfos.empty() || outputInfos.empty()) {
         LOGE("PE tensor info empty");
@@ -742,7 +804,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_runPatchEncoder(JNIEnv* env, jobject thiz, js
         input.count = patchData.size();
 
         // Run inference (the output buffers are reused; execute overwrites them fully each time)
-        int ret = g_peRuntime->execute({input}, outputs);
+        int ret = peRt->execute({input}, outputs);
         if (ret != 0) {
             LOGE("PE inference failed patch %d: %d", i, ret);
             cbError(2, "err_pe_infer_failed");
@@ -780,7 +842,8 @@ JNIEXPORT jboolean JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_runImageEncoder(JNIEnv* env, jobject thiz, jstring jWorkDir) {
     std::string workDir = jstrToString(env, jWorkDir);
 
-    if (!g_ieRuntime || !g_ieRuntime->isReady()) {
+    sharp::ModelRuntime* ieRt = rt("ie");
+    if (!ieRt || !ieRt->isReady() || !ieRt->hasModel()) {
         LOGE("IE runtime not ready");
         cbError(3, "err_ie_not_loaded");
         return JNI_FALSE;
@@ -797,8 +860,8 @@ Java_com_sharp_qnn_pipeline_QnnJni_runImageEncoder(JNIEnv* env, jobject thiz, js
 
     LOGI("runImageEncoder entry RSS=%zuKB", selfVmRSS_kB());
 
-    const auto& inputInfos = g_ieRuntime->getInputInfos();
-    const auto& outputInfos = g_ieRuntime->getOutputInfos();
+    const auto& inputInfos = ieRt->getInputInfos();
+    const auto& outputInfos = ieRt->getOutputInfos();
 
     // Build the input
     qnn::Tensor input;
@@ -819,7 +882,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_runImageEncoder(JNIEnv* env, jobject thiz, js
     }
 
     // Run inference
-    int ret = g_ieRuntime->execute({input}, outputs);
+    int ret = ieRt->execute({input}, outputs);
     if (ret != 0) {
         LOGE("IE inference failed: %d", ret);
         cbError(3, "err_ie_infer_failed");
@@ -870,12 +933,12 @@ Java_com_sharp_qnn_pipeline_QnnJni_runMerge(JNIEnv* env, jobject thiz,
 // searchDirs: directories to search for input files (matching <name>.raw via the sanitized tensor name)
 // outputDir: output file directory
 // Output file name = sanitizeTensorName(tensor name) + ".raw"
-static bool runRestInference(qnn::HtpRuntime* rt,
+static bool runRestInference(sharp::ModelRuntime* rt,
                              const std::map<std::string, std::string>& explicitInputs,
                              const std::vector<std::string>& searchDirs,
                              const std::string& outputDir,
                              int stageId, const char* stageName) {
-    if (!rt || !rt->isReady()) {
+    if (!rt || !rt->isReady() || !rt->hasModel()) {
         LOGE("%s runtime not ready", stageName);
         std::string msgNotReady = std::string("err_runtime_not_ready|") + stageName;
         cbError(stageId, msgNotReady.c_str());
@@ -1067,10 +1130,10 @@ static bool runRestInference(qnn::HtpRuntime* rt,
     const size_t CHUNK = 1u << 20;  // 1M elements per chunk (4MB float scratch)
     // On early failure, release the quantized buffers not yet persisted to avoid hundreds of MB lingering into the next execute
     auto releaseUnwritten = [&](size_t from) {
-        for (size_t k = from; k < outputs.size(); k++) rt->releaseQuantizedOutput(k);
+        for (size_t k = from; k < outputs.size(); k++) rt->releaseRawOutput(k);
     };
     for (size_t j = 0; j < outputs.size(); j++) {
-        const uint8_t* raw = rt->getQuantizedOutputData(j);
+        const uint8_t* raw = rt->getRawOutputData(j);
         if (!raw) {
             LOGE("%s output tensor '%s' data missing", stageName, outputs[j].name.c_str());
             std::string msgOutMissing = std::string("err_output_missing|") + stageName;
@@ -1080,7 +1143,7 @@ static bool runRestInference(qnn::HtpRuntime* rt,
         }
 
         // Locate this output's quantization params (scale/offset)
-        const qnn::HtpRuntime::TensorInfo* oinfo = nullptr;
+        const sharp::TensorInfo* oinfo = nullptr;
         for (const auto& oi : outputInfos) {
             if (oi.name == outputs[j].name) { oinfo = &oi; break; }
         }
@@ -1129,9 +1192,30 @@ static bool runRestInference(qnn::HtpRuntime* rt,
         restCachePut(outputs[j].name, raw, outputs[j].count, oinfo);
 
         // This tensor is persisted, so return its quantized buffer (write-phase memory shrinks as files complete)
-        rt->releaseQuantizedOutput(j);
+        rt->releaseRawOutput(j);
     }
     return true;
+}
+
+// Copies the output whose name contains `key` from outDir/<sanitized>.raw to dst.
+// Returns false if the runtime has no such output or the copy fails.
+static bool copyNamedOutput(sharp::ModelRuntime* r, const std::string& outDir,
+                            const std::string& key, const std::string& dst) {
+    if (!r) return false;
+    for (const auto& out : r->getOutputInfos()) {
+        if (out.name == key || out.name.find(key) != std::string::npos) {
+            std::string src = outDir + "/" + sanitizeTensorName(out.name) + ".raw";
+            std::ifstream srcF(src, std::ios::binary);
+            std::ofstream dstF(dst, std::ios::binary);
+            if (!srcF || !dstF) {
+                LOGE("copy %s -> %s failed", src.c_str(), dst.c_str());
+                return false;
+            }
+            dstF << srcF.rdbuf();
+            return true;
+        }
+    }
+    return false;
 }
 
 // REST Seg A: feature fusion
@@ -1152,7 +1236,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_runRestSegA(JNIEnv* env, jobject thiz, jstrin
     };
     std::string outDir = workDir + "/rest_a_out";
 
-    if (!runRestInference(g_restARuntime.get(), explicitInputs,                           {workDir}, outDir, 5, "Feature Fusion")) {
+    if (!runRestInference(rt("rest_a"), explicitInputs,                           {workDir}, outDir, 5, "Feature Fusion")) {
         return JNI_FALSE;
     }
 
@@ -1172,38 +1256,16 @@ Java_com_sharp_qnn_pipeline_QnnJni_runRestSegB(JNIEnv* env, jobject thiz, jstrin
     std::string outDir = workDir + "/rest_b_out";
 
     LOGI("runRestSegB entry RSS=%zuKB", selfVmRSS_kB());
-    if (!runRestInference(g_restBRuntime.get(), explicitInputs,
+    if (!runRestInference(rt("rest_b"), explicitInputs,
                           {workDir + "/rest_a_out"}, outDir, 6, "Disparity Estimation")) {
         return JNI_FALSE;
     }
 
-    // Find the disparity output and copy it to workDir/disparity.raw (used by Seg C and Post)
-    const auto& bOutputs = g_restBRuntime->getOutputInfos();
-    bool dispFound = false;
-    for (const auto& out : bOutputs) {
-        if (out.name == "disparity" || out.name.find("disparity") != std::string::npos) {
-            std::string src = outDir + "/" + sanitizeTensorName(out.name) + ".raw";
-            std::string dst = workDir + "/disparity.raw";
-            {
-                std::ifstream srcF(src, std::ios::binary);
-                std::ofstream dstF(dst, std::ios::binary);
-                if (!srcF || !dstF) {
-                    LOGE("disparity copy failed");
-                    cbError(6, "err_disparity_copy_failed");
-                    return JNI_FALSE;
-                }
-                dstF << srcF.rdbuf();
-            }
-            // disparity (18.9MB) exceeds the 8MB cache threshold, so it never enters the cache (restCachePut returns early);
-            // Seg C reads workDir/disparity.raw instead of re-reading the copy under rest_b_out
-            dispFound = true;
-            break;
-        }
-    }
-    if (!dispFound) {
-        LOGE("disparity output tensor not found");
-        cbError(6, "err_disparity_output_missing");
-        return JNI_FALSE;
+    // Copy the disparity output to workDir/disparity.raw (used by Seg C and Post).
+    // Splits differ by export: upstream's DLCs and the auto-cut ONNX emit it from
+    // seg B; if a split emits it from seg C instead, runRestSegC copies it there.
+    if (!copyNamedOutput(rt("rest_b"), outDir, "disparity", workDir + "/disparity.raw")) {
+        LOGI("runRestSegB: no disparity output in seg B (expected from seg C)");
     }
 
     LOGI("runRestSegB exit RSS=%zuKB", selfVmRSS_kB());
@@ -1235,37 +1297,26 @@ Java_com_sharp_qnn_pipeline_QnnJni_runRestSegC(JNIEnv* env, jobject thiz,
     std::string outDir = workDir + "/rest_c_out";
 
     LOGI("runRestSegC entry RSS=%zuKB", selfVmRSS_kB());
-    if (!runRestInference(g_restCRuntime.get(), explicitInputs,
+    if (!runRestInference(rt("rest_c"), explicitInputs,
                           {workDir + "/rest_a_out", workDir + "/rest_b_out"},
                            outDir, 7, "Gaussian Delta")) {
         return JNI_FALSE;
     }
 
-    // Find the delta output and copy it to workDir/delta.raw (used by Post)
-    const auto& cOutputs = g_restCRuntime->getOutputInfos();
-    bool deltaFound = false;
-    for (const auto& out : cOutputs) {
-        if (out.name == "delta" || out.name.find("delta") != std::string::npos) {
-            std::string src = outDir + "/" + sanitizeTensorName(out.name) + ".raw";
-            std::string dst = workDir + "/delta.raw";
-            {
-                std::ifstream srcF(src, std::ios::binary);
-                std::ofstream dstF(dst, std::ios::binary);
-                if (!srcF || !dstF) {
-                    LOGE("delta copy failed");
-                    cbError(7, "err_delta_copy_failed");
-                    return JNI_FALSE;
-                }
-                dstF << srcF.rdbuf();
-            }
-            deltaFound = true;
-            break;
-        }
-    }
-    if (!deltaFound) {
+    // Copy delta (and disparity, if this split emits it from seg C) for Post
+    if (!copyNamedOutput(rt("rest_c"), outDir, "delta", workDir + "/delta.raw")) {
         LOGE("delta output tensor not found");
         cbError(7, "err_delta_output_missing");
         return JNI_FALSE;
+    }
+    copyNamedOutput(rt("rest_c"), outDir, "disparity", workDir + "/disparity.raw");
+    {
+        std::ifstream chk(workDir + "/disparity.raw", std::ios::binary);
+        if (!chk) {
+            LOGE("disparity output tensor not found in seg B or C");
+            cbError(7, "err_disparity_output_missing");
+            return JNI_FALSE;
+        }
     }
 
     // Clear the REST cache (the pipeline inference is complete)
@@ -1300,7 +1351,7 @@ Java_com_sharp_qnn_pipeline_QnnJni_runPost(JNIEnv* env, jobject thiz,
 JNIEXPORT void JNICALL
 Java_com_sharp_qnn_pipeline_QnnJni_freeModel(JNIEnv* env, jobject thiz, jstring jModelType) {
     std::string modelType = jstrToString(env, jModelType);
-    auto& runtime = runtimeFor(modelType);
+    sharp::ModelRuntime* runtime = rt(modelType);
     if (runtime) {
         LOGI("freeModel before RSS=%zuKB", selfVmRSS_kB());
         runtime->freeGraph();
@@ -1376,8 +1427,11 @@ Java_com_sharp_qnn_pipeline_QnnJni_validateModelFile(JNIEnv* env, jobject thiz,
     if (size == 0) {
         return env->NewStringUTF("File is empty (0 bytes)");
     }
-    if (size > 1024 * 1024 * 1024) { // > 1GB is unreasonable
-        return env->NewStringUTF("File too large (> 1GB)");
+    // > 1GB is unreasonable for the quantised HTP set; FP32 ONNX encoders are ~1.2GB
+    // (protobuf caps a single .onnx at 2GB)
+    const size_t maxSize = (format == "onnx") ? (size_t)2048 * 1024 * 1024 : (size_t)1024 * 1024 * 1024;
+    if (size > maxSize) {
+        return env->NewStringUTF(format == "onnx" ? "File too large (> 2GB)" : "File too large (> 1GB)");
     }
 
     // Read the first 16 bytes for format checking
@@ -1409,6 +1463,12 @@ Java_com_sharp_qnn_pipeline_QnnJni_validateModelFile(JNIEnv* env, jobject thiz,
             return env->NewStringUTF("Invalid DLC: root table offset exceeds file size");
         }
         LOGI("validateModelFile: DLC OK, size=%zu bytes, rootOffset=%u", size, rootOffset);
+    } else if (format == "onnx") {
+        // ONNX ModelProto: protobuf whose first field is ir_version (tag 0x08); 2GB protobuf cap
+        if (size < 16) return env->NewStringUTF("ONNX file too small (< 16 bytes)");
+        if ((unsigned char)header[0] != 0x08)
+            return env->NewStringUTF("Invalid ONNX: does not start with ir_version field");
+        LOGI("validateModelFile: ONNX OK, size=%zu bytes", size);
     } else {
         return env->NewStringUTF("Unknown model format");
     }
@@ -1662,6 +1722,96 @@ Java_com_sharp_qnn_pipeline_QnnJni_runAnyCalib(JNIEnv* env, jobject thiz,
     float vals[] = {fx, fy};
     env->SetFloatArrayRegion(result, 0, 2, vals);
     return result;
+}
+
+// ======  ======
+// ====== ONNX Runtime CPU fallback backend ======
+
+// Initialises the ORT runtimes for the 5 core slots and makes ORT the active backend.
+// threads <= 0: use the big-core count. Returns true on success.
+JNIEXPORT jboolean JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_nativeInitOrt(JNIEnv* env, jobject thiz,
+                                                 jint jThreads, jboolean jXnnpack) {
+    std::lock_guard<std::mutex> lock(g_initMutex);
+    g_ortOpts.intraOpThreads = jThreads > 0 ? (int)jThreads : bigCoreCount();
+    g_ortOpts.useXnnpack = jXnnpack == JNI_TRUE;
+    g_ortRuntimes.clear();
+    for (const char* t : {"pe", "ie", "rest_a", "rest_b", "rest_c"}) {
+        auto r = std::make_unique<ortrt::OrtRuntime>();
+        if (r->init(g_ortOpts) != 0) {
+            LOGE("nativeInitOrt: init failed for %s", t);
+            g_ortRuntimes.clear();
+            return JNI_FALSE;
+        }
+        g_ortRuntimes[t] = std::move(r);
+    }
+    g_restCacheMaxBytes = adaptiveCacheThreshold();
+    g_restCacheTotalBudget = adaptiveCacheBudget();
+    sharp_set_progress_callback(sharpProgressCallback);
+    g_backend = Backend::ORT;
+    LOGI("nativeInitOrt OK: threads=%d xnnpack=%d", g_ortOpts.intraOpThreads, (int)g_ortOpts.useXnnpack);
+    return JNI_TRUE;
+}
+
+// Loads an ONNX model into the ORT runtime of the given slot
+JNIEXPORT jboolean JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_loadOnnxModel(JNIEnv* env, jobject thiz,
+                                                 jstring jModelType, jstring jPath) {
+    std::string modelType = jstrToString(env, jModelType);
+    std::string path = jstrToString(env, jPath);
+    auto it = g_ortRuntimes.find(modelType);
+    if (it == g_ortRuntimes.end()) {
+        LOGE("loadOnnxModel: no ORT runtime for %s (nativeInitOrt not called?)", modelType.c_str());
+        return JNI_FALSE;
+    }
+    LOGI("loadOnnxModel: type=%s path=%s RSS=%zuKB", modelType.c_str(), path.c_str(), selfVmRSS_kB());
+    int r = it->second->load(path);
+    if (r != 0) {
+        LOGE("loadOnnxModel failed: %d", r);
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+// Active backend label: "HTP", "ORT-CPU", "ORT-XNNPACK" or "" when none is initialised
+JNIEXPORT jstring JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_getBackendName(JNIEnv* env, jobject thiz) {
+    const char* n = "";
+    if (g_backend == Backend::HTP) n = "HTP";
+    else if (g_backend == Backend::ORT) n = g_ortOpts.useXnnpack ? "ORT-XNNPACK" : "ORT-CPU";
+    return env->NewStringUTF(n);
+}
+
+// Thread count the ORT backend uses (0 when ORT is not active)
+JNIEXPORT jint JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_getOrtThreads(JNIEnv* env, jobject thiz) {
+    return g_backend == Backend::ORT ? g_ortOpts.intraOpThreads : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_defaultThreadCount(JNIEnv* env, jobject thiz) {
+    return bigCoreCount();
+}
+
+// Peak RSS (VmHWM) in kB
+JNIEXPORT jlong JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_getPeakRssKb(JNIEnv* env, jobject thiz) {
+    return (jlong)selfVmHWM_kB();
+}
+
+// Current RSS in kB
+JNIEXPORT jlong JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_getRssKb(JNIEnv* env, jobject thiz) {
+    return (jlong)selfVmRSS_kB();
+}
+
+// Resets VmHWM to the current RSS (writes "5" to /proc/self/clear_refs)
+JNIEXPORT void JNICALL
+Java_com_sharp_qnn_pipeline_QnnJni_resetPeakRss(JNIEnv* env, jobject thiz) {
+    FILE* f = fopen("/proc/self/clear_refs", "w");
+    if (!f) { LOGE("resetPeakRss: cannot open clear_refs"); return; }
+    fputs("5", f);
+    fclose(f);
 }
 
 } // extern "C"

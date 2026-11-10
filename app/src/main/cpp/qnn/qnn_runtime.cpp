@@ -1016,6 +1016,12 @@ int HtpRuntime::execute(const std::vector<Tensor>& inputs, std::vector<Tensor>& 
                 m_outQuantBuf[i].ensure(outputs[i].count * sizeof(uint16_t));
                 t.clientBuf.data = m_outQuantBuf[i].data();
                 t.clientBuf.dataSize = outputs[i].count * sizeof(uint16_t);
+            } else if (keepOutputQuantized && outputs[i].data == nullptr) {
+                // FP32 output in keep-raw mode (FP32 DLCs): the caller passes no buffer,
+                // so receive into the runtime-owned buffer (read via getRawOutputData)
+                m_outQuantBuf[i].ensure(outputs[i].count * sizeof(float));
+                t.clientBuf.data = m_outQuantBuf[i].data();
+                t.clientBuf.dataSize = outputs[i].count * sizeof(float);
             } else {
                 t.clientBuf.data = outputs[i].data;
                 t.clientBuf.dataSize = outputs[i].count * sizeof(float);

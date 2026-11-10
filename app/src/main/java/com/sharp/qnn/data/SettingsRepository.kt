@@ -62,6 +62,9 @@ class SettingsRepository(private val context: Context) {
         val PLY_SOR_STD_RATIO = doublePreferencesKey("ply_sor_std_ratio")
         val PLY_MERGE_CAP = doublePreferencesKey("ply_merge_cap")
         val IMAGE_DIRECTORIES = stringPreferencesKey("image_directories")
+        val BACKEND_OVERRIDE = stringPreferencesKey("backend_override")
+        val CPU_THREADS = intPreferencesKey("cpu_threads")
+        val DUMP_TENSORS = booleanPreferencesKey("dump_tensors")
     }
 
     /** HTP 调度类型 */
@@ -225,8 +228,22 @@ class SettingsRepository(private val context: Context) {
         val plySorNeighbors: Int = 10,
         val plySorStdRatio: Double = 2.0,
         val plyMergeCap: Double = 0.5,
-        val imageDirectories: Set<String> = emptySet()
+        val imageDirectories: Set<String> = emptySet(),
+        /** Inference backend selection (developer override) */
+        val backendOverride: BackendOverride = BackendOverride.AUTO,
+        /** ORT CPU threads; 0 = auto (big-core count) */
+        val cpuThreads: Int = 0,
+        /** Dump raw model outputs to files/dumps/ after each run (for tools/compare_outputs.py) */
+        val dumpTensors: Boolean = false
     )
+
+    /** Backend override: AUTO probes HTP and falls back to CPU; HTP/CPU force one */
+    enum class BackendOverride(val key: String) {
+        AUTO("auto"), HTP("htp"), CPU("cpu");
+        companion object {
+            fun fromKey(key: String?): BackendOverride = entries.firstOrNull { it.key == key } ?: AUTO
+        }
+    }
 
     val settingsFlow: Flow<Settings> = context.settingsDataStore.data.map { prefs ->
         Settings(
@@ -249,7 +266,10 @@ class SettingsRepository(private val context: Context) {
             plySorNeighbors = prefs[Keys.PLY_SOR_NEIGHBORS] ?: DEFAULTS.plySorNeighbors,
             plySorStdRatio = prefs[Keys.PLY_SOR_STD_RATIO] ?: DEFAULTS.plySorStdRatio,
             plyMergeCap = prefs[Keys.PLY_MERGE_CAP] ?: DEFAULTS.plyMergeCap,
-            imageDirectories = prefs[Keys.IMAGE_DIRECTORIES]?.split(",")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+            imageDirectories = prefs[Keys.IMAGE_DIRECTORIES]?.split(",")?.filter { it.isNotBlank() }?.toSet() ?: emptySet(),
+            backendOverride = BackendOverride.fromKey(prefs[Keys.BACKEND_OVERRIDE]),
+            cpuThreads = prefs[Keys.CPU_THREADS] ?: 0,
+            dumpTensors = prefs[Keys.DUMP_TENSORS] ?: false
         )
     }
 
@@ -335,6 +355,18 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setPlyMergeCap(cap: Double) {
         context.settingsDataStore.edit { it[Keys.PLY_MERGE_CAP] = cap }
+    }
+
+    suspend fun setBackendOverride(o: BackendOverride) {
+        context.settingsDataStore.edit { it[Keys.BACKEND_OVERRIDE] = o.key }
+    }
+
+    suspend fun setCpuThreads(n: Int) {
+        context.settingsDataStore.edit { it[Keys.CPU_THREADS] = n.coerceIn(0, 16) }
+    }
+
+    suspend fun setDumpTensors(enable: Boolean) {
+        context.settingsDataStore.edit { it[Keys.DUMP_TENSORS] = enable }
     }
 
     suspend fun setImageDirectories(dirs: Set<String>) {

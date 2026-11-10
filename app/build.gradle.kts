@@ -17,6 +17,13 @@ val qnnSdkDir: String = (project.findProperty("qnn.sdk.dir") as String?)
     ?: localProps.getProperty("qnn.sdk.dir")
     ?: error("请在 local.properties 中设置 qnn.sdk.dir")
 
+// ONNX Runtime (CPU fallback backend). The AAR has no prefab, so extractOrt
+// unpacks its headers + libonnxruntime.so for CMake; the regular dependency
+// below packages the .so into the APK.
+val ortVersion = "1.31.1"
+val ortNative: Configuration by configurations.creating
+val ortDir = layout.buildDirectory.dir("ort/$ortVersion")
+
 android {
     namespace = "com.sharp.qnn"
     compileSdk = 35
@@ -37,6 +44,7 @@ android {
                 cppFlags += "-std=c++17 -O2 -fexceptions -frtti"
                 arguments += "-DANDROID_STL=c++_shared"
                 arguments += "-DQNN_SDK_DIR=$qnnSdkDir"
+                arguments += "-DORT_DIR=${ortDir.get().asFile.absolutePath}"
             }
         }
     }
@@ -114,6 +122,19 @@ tasks.matching { it.name.contains("Lint", ignoreCase = true) }.configureEach {
 }
 tasks.matching { it.name.matches(Regex("merge.*JniLib.*")) }.configureEach {
     dependsOn("copyQnnLibs")
+}
+
+// Unpack the ORT AAR (headers + jni libs) for CMake
+val extractOrt by tasks.registering(Sync::class) {
+    description = "Unpack onnxruntime-android AAR headers/libs for CMake"
+    group = "build setup"
+    from({ ortNative.map { zipTree(it) } }) {
+        include("headers/**", "jni/**")
+    }
+    into(ortDir)
+}
+tasks.matching { it.name.startsWith("configureCMake") || it.name.startsWith("buildCMake") }.configureEach {
+    dependsOn(extractOrt)
 }
 
 // 任务: 从 QNN SDK 复制 Android HTP 库到 jniLibs
@@ -200,4 +221,9 @@ dependencies {
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // ONNX Runtime (CPU fallback). MIT license. Packaged for libonnxruntime.so;
+    // native code links it directly (see extractOrt / CMake ORT_DIR).
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:$ortVersion")
+    ortNative("com.microsoft.onnxruntime:onnxruntime-android:$ortVersion@aar")
 }

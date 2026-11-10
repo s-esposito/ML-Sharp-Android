@@ -20,6 +20,22 @@ include_directories(${QNN_SDK_DIR}/include/QNN/HTP)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/qnn)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/core)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ort)
+
+# ============== ONNX Runtime (CPU fallback backend) ==============
+# ORT_DIR is unpacked from the onnxruntime-android AAR by the Gradle task extractOrt:
+#   ${ORT_DIR}/headers/*.h, ${ORT_DIR}/jni/${ANDROID_ABI}/libonnxruntime.so
+# (the AAR ships no prefab). The .so itself is packaged into the APK by the
+# Gradle dependency, so here it is only linked.
+if(NOT ORT_DIR)
+    message(FATAL_ERROR "ORT_DIR not set (run via Gradle: extractOrt)")
+endif()
+message(STATUS "ORT_DIR = ${ORT_DIR}")
+add_library(onnxruntime SHARED IMPORTED)
+set_target_properties(onnxruntime PROPERTIES
+    IMPORTED_LOCATION ${ORT_DIR}/jni/${ANDROID_ABI}/libonnxruntime.so
+    INTERFACE_INCLUDE_DIRECTORIES ${ORT_DIR}/headers)
 
 # ============== 编译选项 ==============
 add_compile_options(
@@ -89,6 +105,7 @@ set(QNN_SOURCES
     qnn/qnn_runtime.cpp
     qnn/qnn_dlc_compiler.cpp
     qnn/qnn_tensor.cpp
+    ort/ort_runtime.cpp
 )
 
 # ============== JNI 桥接层 ==============
@@ -108,6 +125,7 @@ add_library(${SHARP_LIB_NAME} SHARED
 target_link_libraries(${SHARP_LIB_NAME} PRIVATE
     sharp_core
     gauss_simplify_lib
+    onnxruntime  # ORT CPU fallback (libonnxruntime.so from the AAR)
     log     # Android logcat
     dl      # dlopen/dlsym
     android # AssetManager

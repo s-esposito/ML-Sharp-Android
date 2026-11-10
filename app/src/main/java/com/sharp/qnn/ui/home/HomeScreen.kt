@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.BrokenImage
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.Button
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -242,6 +243,14 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 // 确保 QNN 运行时已初始化（AnyCalib 需要原生运行时�?
                 // Ensure QNN runtime is initialized (AnyCalib needs the native runtime)
                 sharpApp.pipelineManager.ensureQnnInitialized()
+                // AnyCalib ships only as an HTP DLC; the CPU backend has no AnyCalib model yet
+                if (sharpApp.pipelineManager.isCpuBackend) {
+                    withContext(Dispatchers.Main) {
+                        _anyCalibRunning.value = false
+                        _exportMessage.value = MsgKey.ERR_NEEDS_NPU
+                    }
+                    return@launch
+                }
 
                 val rawPath = prepareAnyCalibRaw(uri)
                 if (rawPath == null) {
@@ -850,6 +859,14 @@ fun HomeScreen(
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface
                 )
+                // Active inference backend: "NPU (HTP)" / "CPU (ONNX Runtime, N threads)"
+                if (pipelineState.backendLabel.isNotEmpty()) {
+                    Spacer(Modifier.size(Spacing.xs))
+                    AssistChip(
+                        onClick = {},
+                        label = { Text(stringResource(R.string.home_backend_chip, pipelineState.backendLabel)) }
+                    )
+                }
             }
         }
 
@@ -887,6 +904,18 @@ fun HomeScreen(
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer
                             )
+                            // One-line run summary: backend + peak memory
+                            if (pipelineState.backendLabel.isNotEmpty()) {
+                                Text(
+                                    text = stringResource(
+                                        R.string.home_run_summary,
+                                        pipelineState.backendLabel,
+                                        pipelineState.peakRssMb
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer
+                                )
+                            }
                         }
                     }
                 }

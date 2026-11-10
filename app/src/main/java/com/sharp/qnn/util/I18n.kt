@@ -91,6 +91,8 @@ object MsgKey {
     const val ERR_STAGE_ERROR = "err_stage_error"
     const val ERR_STAGE_EXCEPTION = "err_stage_exception"
     const val ERR_QNN_INIT = "err_qnn_init"
+    /** Feature requires the NPU (HTP) but the CPU backend is active */
+    const val ERR_NEEDS_NPU = "err_needs_npu"
     const val ERR_SKEL = "err_skel"
     const val ERR_QNN_NATIVE_INIT = "err_qnn_native_init"
     const val ERR_QNN_INIT_DEFAULT = "err_qnn_init_default"
@@ -184,6 +186,7 @@ internal val messageResIds: Map<String, Int> = mapOf(
     MsgKey.ERR_STAGE_ERROR to R.string.err_stage_error,
     MsgKey.ERR_STAGE_EXCEPTION to R.string.err_stage_exception,
     MsgKey.ERR_QNN_INIT to R.string.err_qnn_init,
+    MsgKey.ERR_NEEDS_NPU to R.string.err_needs_npu,
     MsgKey.ERR_SKEL to R.string.err_skel,
     MsgKey.ERR_QNN_NATIVE_INIT to R.string.err_qnn_native_init,
     MsgKey.ERR_QNN_INIT_DEFAULT to R.string.err_qnn_init_default,

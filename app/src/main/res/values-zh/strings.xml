@@ -329,4 +329,20 @@
     <string name="msg_deleted">已删除 %1$s 个文件</string>
     <string name="msg_download_complete">下载完成: %1$s/%2$s 个文件</string>
     <string name="err_download_fail">下载失败: %1$s</string>
+    <!-- Inference backend (developer) -->
+    <string name="settings_backend">推理后端 (开发者)</string>
+    <string name="settings_backend_desc">自动: 可用时使用 NPU (QNN HTP), 否则回退到 CPU (ONNX Runtime)。强制 CPU 需要 sharp_models/onnx/ 下的 ONNX 模型。下次运行时生效。</string>
+    <string name="settings_backend_auto">自动</string>
+    <string name="settings_backend_htp">NPU (HTP)</string>
+    <string name="settings_backend_cpu">CPU (ONNX)</string>
+    <string name="settings_backend_active">当前: %1$s</string>
+    <string name="settings_backend_fallback">未使用 HTP: %1$s</string>
+    <string name="settings_backend_none">当前: 尚未初始化</string>
+    <string name="settings_cpu_threads">CPU 线程数</string>
+    <string name="settings_cpu_threads_auto">自动 (%1$d)</string>
+    <string name="settings_dump_tensors">导出模型输出</string>
+    <string name="settings_dump_tensors_desc">每次运行后将模型原始输入/输出 (~400 MB) 复制到 Android/data/com.sharp.qnn/files/dumps/, 供 tools/compare_outputs.py 使用。</string>
+    <string name="home_backend_chip">后端: %1$s</string>
+    <string name="home_run_summary">%1$s · 峰值内存 %2$d MB</string>
+    <string name="err_needs_npu">此功能需要 NPU (QNN HTP)。当前设备使用 CPU 后端 (ONNX Runtime)。</string>
 </resources>

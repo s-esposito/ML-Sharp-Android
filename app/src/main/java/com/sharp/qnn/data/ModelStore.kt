@@ -84,6 +84,24 @@ class ModelStore(
     /** dlc directory: .dlc models */
     private fun dlcDir(): File = File(modelRootDir(), "dlc").also { ensureDir(it) }
 
+    /**
+     * ONNX directory for the CPU (ONNX Runtime) model set: <modelRoot>/onnx/.
+     * Kept separate from the HTP slots (bin/ dlc/) so both sets can coexist.
+     */
+    fun onnxDir(): File = File(modelRootDir(), "onnx").also { ensureDir(it) }
+
+    /**
+     * ONNX file for a slot, or null if missing. Accepts the app code name (pe.onnx)
+     * or the exporter's name (patch_encoder.onnx / rest_seg_a.onnx ...).
+     */
+    fun onnxModelFile(type: ModelType): File? {
+        val names = listOfNotNull("${type.code}.onnx", ONNX_EXPORT_NAMES[type])
+        return names.map { File(onnxDir(), it) }.firstOrNull { it.isFile && it.length() > 0 }
+    }
+
+    /** Core slots that have no ONNX file yet */
+    fun missingOnnxModels(): List<ModelType> = ModelType.coreTypes.filter { onnxModelFile(it) == null }
+
     /** Get the model info of a slot */
     fun getModel(type: ModelType): ModelEntry? = _models.value[type]
 
@@ -419,5 +437,14 @@ class ModelStore(
 
     companion object {
         private const val TAG = "ModelStore"
+
+        /** build_rest_pipeline.py output names for each slot */
+        private val ONNX_EXPORT_NAMES = mapOf(
+            ModelType.PE to "patch_encoder.onnx",
+            ModelType.IE to "image_encoder.onnx",
+            ModelType.REST_A to "rest_seg_a.onnx",
+            ModelType.REST_B to "rest_seg_b.onnx",
+            ModelType.REST_C to "rest_seg_c.onnx",
+        )
     }
 }

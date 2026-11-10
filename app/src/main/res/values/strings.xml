@@ -327,4 +327,20 @@
     <string name="msg_deleted">Deleted %1$s file(s)</string>
     <string name="msg_download_complete">Download complete: %1$s/%2$s files</string>
     <string name="err_download_fail">Download failed: %1$s</string>
+    <!-- Inference backend (developer) -->
+    <string name="settings_backend">Inference backend (developer)</string>
+    <string name="settings_backend_desc">Auto uses the NPU (QNN HTP) when available and falls back to the CPU (ONNX Runtime). Forcing CPU needs the ONNX model set in sharp_models/onnx/. Changes apply on the next run.</string>
+    <string name="settings_backend_auto">Auto</string>
+    <string name="settings_backend_htp">NPU (HTP)</string>
+    <string name="settings_backend_cpu">CPU (ONNX)</string>
+    <string name="settings_backend_active">Active: %1$s</string>
+    <string name="settings_backend_fallback">HTP not used: %1$s</string>
+    <string name="settings_backend_none">Active: not initialized yet</string>
+    <string name="settings_cpu_threads">CPU threads</string>
+    <string name="settings_cpu_threads_auto">Auto (%1$d)</string>
+    <string name="settings_dump_tensors">Dump model outputs</string>
+    <string name="settings_dump_tensors_desc">After each run, copy raw model inputs/outputs (~400 MB) to Android/data/com.sharp.qnn/files/dumps/ for tools/compare_outputs.py.</string>
+    <string name="home_backend_chip">Backend: %1$s</string>
+    <string name="home_run_summary">%1$s · peak memory %2$d MB</string>
+    <string name="err_needs_npu">This needs the NPU (QNN HTP). This device is using the CPU backend (ONNX Runtime).</string>
 </resources>

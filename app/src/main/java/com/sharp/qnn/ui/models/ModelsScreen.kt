@@ -258,6 +258,9 @@ class ModelsViewModel(app: Application) : AndroidViewModel(app) {
                     val initResult = kotlin.runCatching { sharpApp.pipelineManager.ensureQnnInitialized() }
                     if (initResult.isFailure) {
                         Result.failure(initResult.exceptionOrNull() ?: RuntimeException(MsgKey.ERR_QNN_INIT_DEFAULT))
+                    } else if (sharpApp.pipelineManager.isCpuBackend) {
+                        // DLC -> HTP context compilation is impossible on the CPU backend
+                        Result.failure(RuntimeException(MsgKey.ERR_NEEDS_NPU))
                     } else {
                         sharpApp.modelStore.compileModel(type)
                     }
@@ -330,6 +333,9 @@ class ModelsViewModel(app: Application) : AndroidViewModel(app) {
                 val initResult = kotlin.runCatching { sharpApp.pipelineManager.ensureQnnInitialized() }
                 if (initResult.isFailure) {
                     Result.failure(initResult.exceptionOrNull() ?: RuntimeException(MsgKey.ERR_QNN_INIT_DEFAULT))
+                } else if (sharpApp.pipelineManager.isCpuBackend) {
+                    // DLC -> HTP context compilation is impossible on the CPU backend
+                    Result.failure(RuntimeException(MsgKey.ERR_NEEDS_NPU))
                 } else {
                     sharpApp.modelStore.compileModel(type)
                 }

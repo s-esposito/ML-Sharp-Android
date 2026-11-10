@@ -50,6 +50,16 @@ class PipelineManager(
 
     private val runMutex = Mutex()
 
+    /** Active inference backend (null until the first init) */
+    private val _backend = MutableStateFlow<BackendInfo?>(null)
+    val backend: StateFlow<BackendInfo?> = _backend.asStateFlow()
+
+    /** True when the CPU (ONNX Runtime) fallback is active */
+    val isCpuBackend: Boolean get() = _backend.value?.isCpu == true
+
+    // Per-run model load timings (ms), for the benchmark summary
+    private val modelLoadMs = linkedMapOf<ModelType, Long>()
+
     // Runtime state
     @Volatile
     private var initialized = false
@@ -123,8 +133,18 @@ class PipelineManager(
                 // Register the callback
                 runCatching { QnnJni.setProgressCallback(this@PipelineManager) }
 
-                // 1. Initialize the QNN runtime and compile any DLC models
+                // 1. Initialize the backend (HTP preferred, CPU fallback) and compile any DLC models
+                QnnJni.resetPeakRss()
+                modelLoadMs.clear()
                 ensureReadyForCompile()
+                _backend.value?.let { b ->
+                    _state.update { st ->
+                        st.copy(
+                            backendLabel = b.label,
+                            stages = if (b.isCpu) st.stages.filter { it.id != COMPILE_STAGE_ID } else st.stages
+                        )
+                    }
+                }
 
                 // Init stage done
                 onStageComplete(PREPARE_STAGE_ID, "Initialization", System.currentTimeMillis() - pipelineStartTime)
@@ -234,6 +254,12 @@ class PipelineManager(
                     return@withContext Result.failure(IOException("runPost failed"))
                 }
 
+                // Debug: dump raw model outputs (before in-place PLY optimization)
+                if (plySettings.dumpTensors) {
+                    runCatching { dumpTensors(workDir, fpx, origW, origH) }
+                        .onFailure { android.util.Log.w(TAG, "Tensor dump failed", it) }
+                }
+
                 // SOR / kNN Merge)
                 if (plySettings.plyOptimize) {
                     android.util.Log.i(TAG, "PLY optimization enabled, running GaussSimplify...")
@@ -258,10 +284,15 @@ class PipelineManager(
                 // Done
                 val totalElapsed = System.currentTimeMillis() - pipelineStartTime
                 android.util.Log.i(TAG, "=== Pipeline done, total ${totalElapsed}ms, PLY=$plyPath ===")
+                val peakMb = QnnJni.getPeakRssKb() / 1024
+                val summary = benchSummary(totalElapsed, peakMb)
+                android.util.Log.i(BENCH_TAG, summary)
                 _state.value = _state.value.copy(
                     isRunning = false,
                     totalElapsedMs = totalElapsed,
-                    errorMessage = null
+                    errorMessage = null,
+                    peakRssMb = peakMb,
+                    benchSummary = summary
                 )
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -294,41 +325,118 @@ class PipelineManager(
     // ======  ======
     // ====== Internals: initialization and model readiness ======
 
-    /** Ensure the QNN runtime is initialized (idempotent). Also required before
-     * standalone compilation from the models tab. */
+    /**
+     * Ensure an inference backend is initialized (idempotent). Also required before
+     * standalone compilation from the models tab.
+     *
+     * Capability probe (no SoC-name gate): HTP is tried first unless the user forced
+     * CPU; any failure (no FastRPC lib, no HTP arch reported, missing skel, native
+     * init error) is logged under [BACKEND_TAG] and the ONNX Runtime CPU backend is
+     * used instead. With the override set to HTP, an HTP failure is an error.
+     */
     suspend fun ensureQnnInitialized() {
         if (initialized) return
         // Notify the init stage (only effective in pipeline context; harmless otherwise)
         onProgress(PREPARE_STAGE_ID, 0, ModelType.coreTypes.size, 0, MsgKey.DETAIL_INIT_QNN)
         // Pin the language for this call (compile progress details use it)
         langCtx = LocaleUtil.wrap(context, settings.settingsFlow.first().language)
-        val libDir = context.applicationInfo.nativeLibraryDir
-        // Pick the Skel from the probe result: the skel must match the device
-        // architecture exactly, so a failed probe is a hard error
-        val arch = QnnJni.probeHtpArch(libDir)
-        if (arch.isBlank()) {
+        val s = settings.settingsFlow.first()
+        val override = s.backendOverride
+
+        val htpFailure: String? = if (override == SettingsRepository.BackendOverride.CPU) {
+            "forced CPU in settings"
+        } else {
+            tryInitHtp(s)
+        }
+        if (htpFailure == null) {
+            _backend.value = BackendInfo(name = "HTP", threads = 0, fallbackReason = null)
+            android.util.Log.i(BACKEND_TAG, "backend=HTP")
+            initialized = true
+            return
+        }
+        if (override == SettingsRepository.BackendOverride.HTP) {
+            android.util.Log.e(BACKEND_TAG, "HTP forced but unavailable: $htpFailure")
             throw IOException(MsgKey.ERR_QNN_INIT)
         }
-        // The HTP perf config must be sent before nativeInit (it applies when
-        // the shared backend/device is created)
-        val s = settings.settingsFlow.first()
-        QnnJni.setPerfConfig(
-            type = s.perfType,
-            lockedCorner = s.perfLockedCorner,
-            minCorner = s.perfRangeMin,
-            targetCorner = s.perfRangeTarget,
-            maxCorner = s.perfRangeMax,
-            dcvsMode = s.perfDcvsMode
-        )
-        val skelDir = SkelExtractor.extractSkel(context, arch)
-            ?: throw IOException(MsgKey.k(MsgKey.ERR_SKEL, arch))
-        val ok = QnnJni.nativeInit(libDir, skelDir, arch)
+        android.util.Log.w(BACKEND_TAG, "HTP unavailable ($htpFailure) -> CPU fallback (ONNX Runtime)")
+        val ok = runCatching { QnnJni.nativeInitOrt(s.cpuThreads, false) }.getOrDefault(false)
         if (!ok) throw IOException(MsgKey.ERR_QNN_NATIVE_INIT)
+        val info = BackendInfo(QnnJni.getBackendName(), QnnJni.getOrtThreads(), htpFailure)
+        _backend.value = info
+        android.util.Log.i(BACKEND_TAG, "backend=${info.name} threads=${info.threads} reason=\"$htpFailure\"")
         initialized = true
+    }
+
+    /** Try to bring up QNN HTP. Returns null on success, or the failure reason. */
+    private fun tryInitHtp(s: SettingsRepository.Settings): String? = try {
+        if (!hasFastRpcLib()) {
+            "libcdsprpc.so not present (no Qualcomm DSP)"
+        } else {
+            val libDir = context.applicationInfo.nativeLibraryDir
+            // The skel must match the device architecture exactly
+            val arch = QnnJni.probeHtpArch(libDir)
+            if (arch.isBlank()) {
+                "probeHtpArch: no HTP device reported"
+            } else {
+                // The HTP perf config must be sent before nativeInit
+                QnnJni.setPerfConfig(
+                    type = s.perfType,
+                    lockedCorner = s.perfLockedCorner,
+                    minCorner = s.perfRangeMin,
+                    targetCorner = s.perfRangeTarget,
+                    maxCorner = s.perfRangeMax,
+                    dcvsMode = s.perfDcvsMode
+                )
+                val skelDir = SkelExtractor.extractSkel(context, arch)
+                when {
+                    skelDir == null -> "no skel library for HTP $arch"
+                    !QnnJni.nativeInit(libDir, skelDir, arch) -> "QNN HTP nativeInit failed (arch=$arch)"
+                    else -> {
+                        android.util.Log.i(BACKEND_TAG, "HTP arch=$arch")
+                        null
+                    }
+                }
+            }
+        }
+    } catch (t: Throwable) {
+        "HTP probe threw: ${t.javaClass.simpleName}: ${t.message}"
+    }
+
+    /** Qualcomm FastRPC user library (needed by the HTP backend) present on this device */
+    private fun hasFastRpcLib(): Boolean =
+        listOf("/vendor/lib64/libcdsprpc.so", "/system/vendor/lib64/libcdsprpc.so", "/system/lib64/libcdsprpc.so")
+            .any { File(it).exists() }
+
+    /**
+     * Tear down the native backend so the next run re-probes (e.g. after the backend
+     * override or thread count changed in settings). No-op while a run is active.
+     */
+    fun reinitBackend() {
+        if (!runMutex.tryLock()) return
+        try {
+            synchronized(loadedModelsLock) { loadedModels.clear() }
+            runCatching { QnnJni.nativeDestroy() }
+            initialized = false
+            _backend.value = null
+        } finally {
+            runMutex.unlock()
+        }
     }
 
     private suspend fun ensureReadyForCompile() {
         ensureQnnInitialized()
+
+        if (isCpuBackend) {
+            // CPU backend: no DLC compilation; the ONNX set must be present
+            val missing = modelStore.missingOnnxModels()
+            if (missing.isNotEmpty()) {
+                throw IOException(
+                    "CPU backend: missing ONNX models ${missing.joinToString { it.code + ".onnx" }} in " +
+                        modelStore.onnxDir().absolutePath
+                )
+            }
+            return
+        }
 
         // Models to compile (DLC and not yet compiled)
         val toCompile = ModelType.coreTypes.filter { type ->
@@ -371,6 +479,23 @@ class PipelineManager(
     private suspend fun ensureModelLoaded(type: ModelType) {
         synchronized(loadedModelsLock) { if (loadedModels.contains(type)) return }
 
+        if (isCpuBackend) {
+            val f = modelStore.onnxModelFile(type)
+                ?: throw IllegalStateException("ONNX model for ${type.code} missing in ${modelStore.onnxDir()}")
+            QnnJni.validateModelFile(f.absolutePath, "onnx")?.let {
+                throw IOException("Invalid ONNX ${f.name}: $it")
+            }
+            val t0 = System.currentTimeMillis()
+            android.util.Log.i(TAG, "Loading ONNX on-demand: ${type.code} <- ${f.name} (${f.length() / 1_000_000} MB)")
+            if (!QnnJni.loadOnnxModel(type.code, f.absolutePath)) {
+                throw IOException(MsgKey.k(MsgKey.ERR_MODEL_LOAD_FAILED, modelName(type)))
+            }
+            modelLoadMs[type] = System.currentTimeMillis() - t0
+            synchronized(loadedModelsLock) { loadedModels.add(type) }
+            return
+        }
+        val loadStart = System.currentTimeMillis()
+
         val entry: ModelEntry = modelStore.getModel(type)
             ?: throw IllegalStateException(MsgKey.k(MsgKey.ERR_MODEL_NOT_IMPORTED, modelName(type)))
 
@@ -391,7 +516,66 @@ class PipelineManager(
         android.util.Log.i(TAG, "Loading model on-demand: ${type.displayName} (${type.code}), binSize=${ready.fileSize}")
         val ok = QnnJni.loadContextBinary(type.code, binPath)
         if (!ok) throw IOException(MsgKey.k(MsgKey.ERR_MODEL_LOAD_FAILED, modelName(type)))
+        modelLoadMs[type] = System.currentTimeMillis() - loadStart
         synchronized(loadedModelsLock) { loadedModels.add(type) }
+    }
+
+    // ====== Instrumentation: benchmark summary + tensor dumps ======
+
+    /** One-line, grep-able benchmark summary (logcat tag [BENCH_TAG]) */
+    private fun benchSummary(totalMs: Long, peakMb: Long): String {
+        val b = _backend.value
+        val stages = _state.value.stages.filter { it.id >= 0 && it.isComplete }
+            .joinToString(" ") { "s${it.id}=${it.elapsedMs}" }
+        val loads = modelLoadMs.entries.joinToString(" ") { "load_${it.key.code}=${it.value}" }
+        return "backend=${b?.name ?: "?"} threads=${b?.threads ?: 0} precision=${if (b?.isCpu == true) "fp32" else "w8a16"} " +
+            "total_ms=$totalMs peak_rss_mb=$peakMb $stages $loads device=${android.os.Build.MODEL} soc=${android.os.Build.SOC_MODEL}"
+    }
+
+    /**
+     * Copy raw model inputs/outputs of this run to <externalFiles>/dumps/<timestamp>/
+     * (pull with adb, compare with tools/compare_outputs.py). Skips the ~0.9 GB of
+     * REST inter-segment tensors.
+     */
+    private fun dumpTensors(workDir: File, fpx: Float, origW: Int, origH: Int) {
+        val base = context.getExternalFilesDir(null) ?: context.filesDir
+        val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+        val out = File(base, "dumps/$ts").also { ensureDir(it) }
+        val rel = mutableListOf(
+            "image.raw", "x2.raw", "disparity_factor.raw",
+            "x_latent0.raw", "x_latent1.raw", "x0_feat.raw", "x1_feat.raw", "x2_feat.raw", "x_lowres_feat.raw",
+            "disparity.raw", "delta.raw", "output.ply"
+        )
+        for (p in DUMP_PATCHES) {
+            rel += "patch_p%04d.raw".format(p)
+            File(workDir, "out_pe/Result_$p").listFiles()?.forEach { rel += "out_pe/Result_$p/${it.name}" }
+        }
+        File(workDir, "out_ie/Result_0").listFiles()?.forEach { rel += "out_ie/Result_0/${it.name}" }
+        var bytes = 0L
+        for (r in rel) {
+            val src = File(workDir, r)
+            if (!src.isFile) continue
+            val dst = File(out, r)
+            dst.parentFile?.let { ensureDir(it) }
+            src.copyTo(dst, overwrite = true)
+            bytes += src.length()
+        }
+        val b = _backend.value
+        val meta = org.json.JSONObject().apply {
+            put("backend", b?.name ?: "")
+            put("threads", b?.threads ?: 0)
+            put("fallback_reason", b?.fallbackReason ?: org.json.JSONObject.NULL)
+            put("fpx", fpx.toDouble()); put("orig_w", origW); put("orig_h", origH)
+            put("device", android.os.Build.MODEL); put("soc", android.os.Build.SOC_MODEL)
+            put("pe_patches", org.json.JSONArray(DUMP_PATCHES))
+            put("stage_ms", org.json.JSONObject().apply {
+                _state.value.stages.forEach { put(it.id.toString(), it.elapsedMs) }
+            })
+            put("model_load_ms", org.json.JSONObject().apply { modelLoadMs.forEach { (k, v) -> put(k.code, v) } })
+            put("peak_rss_mb", QnnJni.getPeakRssKb() / 1024)
+        }
+        File(out, "meta.json").writeText(meta.toString(2))
+        android.util.Log.i(BENCH_TAG, "tensor dump: ${out.absolutePath} (${bytes / 1_000_000} MB)")
     }
 
     // Backward compatibility: keep for standalone compilation from Models tab
@@ -584,6 +768,15 @@ class PipelineManager(
 
     companion object {
         private const val TAG = "PipelineManager"
+
+        /** Logcat tag for backend selection decisions */
+        const val BACKEND_TAG = "SHARP_BACKEND"
+
+        /** Logcat tag for per-run benchmark summaries */
+        const val BENCH_TAG = "SHARP_BENCH"
+
+        /** PE patches whose outputs are dumped (first x0 patch, centre x1 patch, x2) */
+        val DUMP_PATCHES = listOf(0, 29, 34)
 
         // Init stage (QNN runtime + model loading, runs first)
         const val PREPARE_STAGE_ID = -2

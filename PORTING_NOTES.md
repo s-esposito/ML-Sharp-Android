@@ -1,7 +1,7 @@
 # Porting notes: ML-Sharp-QNN → non-Snapdragon Android (target: Galaxy A57 / Exynos 1680)
 
 Running log of findings, decisions, benchmarks and open questions.
-Phase status: **Phase 0 (recon) complete. Waiting for go-ahead before Phase 1.**
+Phase status: Phase 0 complete (merged). **Phase 1 in progress** on `phase1-cpu-fallback`: code complete, desktop-verified, waiting on the build toolchain (QNN SDK, NDK) for the on-device test.
 
 ---
 
@@ -143,6 +143,36 @@ What this means:
   * < 8 GB (A52s): int8 weight-only / dynamic-quant PE and IE (~310 MB each, uses dotprod), plus REST possibly split finer. Every model set goes through `compare_outputs.py`.
 * Defaults are chosen by RAM and CPU features at runtime, not by device name.
 
+## 8c. Phase 1 log
+
+**Decisions (user, 2026-11-10):** ORT CPU instead of QNN CPU. ONNX export runs on this Mac in conda env `sharp-export`. Device experiments run on the A52s first.
+
+**Model export (done, local only, not hosted):**
+* Env: conda `sharp-export` (Python 3.12, torch 2.8.0, onnx 1.23.2, onnxruntime 1.31.1, onnxsim). `apple/ml-sharp` is cloned at `~/Codebase/ml-sharp` (commit `aed6527`), with checkpoint `sharp_2572gikvuh.pt` (2.81 GB) from `ml-site.cdn-apple.com`. Use is under `LICENSE_MODEL` (research use).
+* Command: `python build_rest_pipeline.py -t onnx -a all --sharp_root ~/Codebase/ml-sharp -o output`. The new `--sharp_root` option means the script no longer has to live inside the ml-sharp checkout.
+* Output (`output/onnx/`, git-ignored): patch_encoder 1215 MB, image_encoder 1215 MB, rest 186 MB, rest_seg_a 126 MB, rest_seg_b 29 MB, rest_seg_c 32 MB.
+* **Split finding:** with torch 2.8 the hard-coded `CUTS=[52,84]` put `disparity` in seg C, so the app's REST_B contract broke. Cuts are now automatic. Seg B ends right after the node producing `disparity` (node 91 of 249), and A/B is split where the fewest bytes cross. Result: **[24, 92]**, with 878 MB crossing A→B and 897 MB crossing B→C (the old second cut carried 2086 MB). `--cuts a,b` overrides.
+* **Activation sizes (REST, FP32):** the largest single tensor is 1208 MB (`/md_head/md_head.1/ConvTranspose`, 1536²). Many are 604 MB (768²×256). Expect a REST peak of several GB on the CPU path. This decides whether the A52s (5.5 GB) can run FP32.
+* `tools/verify_onnx.py`: **PASS.** Split chain vs. monolithic `rest.onnx` is bit-identical. PE/IE ONNX vs. PyTorch: cos 1.0, max |d| ≤ 1.6e-5.
+
+**Code (commit `e8a2e6a`):** see the commit message. In short:
+* Manifest `required=false` (G1).
+* `sharp::ModelRuntime` interface with `HtpRuntime` (unchanged behaviour) and `OrtRuntime`.
+* Capability probe with logged fallback (G2, G4).
+* Fixes: G7 null FP32 output buffer; uninitialised `Tensor::quantized`; disparity taken from either REST segment.
+* ONNX format plus 2 GB validation for ONNX (G6). DLC compile and AnyCalib say "needs NPU" on the CPU backend (G5).
+* UI backend chip plus peak RSS; Settings > Inference backend (Auto/HTP/CPU, threads, tensor dump).
+* Log tags `SHARP_BACKEND`, `SHARP_BENCH`, `SHARP_ORT`.
+
+Not yet compiled for Android (needs the QNN SDK headers and NDK 29). `ort_runtime.cpp` was syntax-checked with host clang against the ORT 1.31.1 headers.
+
+**Correctness tooling:**
+* `tools/host_post/` builds the app's own C core (prep/pre/merge/post) for the desktop, so the desktop reference uses the exact same C pre/post-processing.
+* `tools/compare_outputs.py --dump <pulled dump>` runs per-model checks (device inputs → desktop FP32 model) and an end-to-end check (device `image.raw` → full desktop pipeline → `.ply`). It reports cosine, max/mean |d| and Gaussian count.
+* `--reference_image <jpg> --out <dir>` makes a desktop-only reference.
+* Self-check on the reference: 51/51 identical.
+* Reference image: `~/Codebase/ml-sharp/data/teaser.jpg` (Apple's, not committed). fpx = 1246.67, 1635×748, **1,179,648 Gaussians**.
+
 ## 9. Open questions
 
 * **Q1** Approve ORT-CPU instead of QNN-CPU for Phase 1?
@@ -153,4 +183,12 @@ What this means:
 
 ## 10. Benchmark table
 
-_No measurements yet._ The A57 rows and the "other device" rows will be kept in separate tables.
+### Galaxy A57 (target)
+_No measurements yet._
+
+### Other devices
+| Device | Backend | Precision | Threads | pre | PE ×35 | IE | merge | REST a+b+c | post | Total | Peak RSS | Accuracy |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Apple M4 Mac (desktop reference, onnxruntime 1.31.1 CPU, Python) | ORT CPU EP | FP32 | default | 0.04 s | 19.5 s | 1.8 s | 0.14 s | 15.1 s | 0.74 s | ~38 s | — | reference |
+| Galaxy A52s (SD778G) | HTP v68 | W8A16 | — | | | | | | | | | |
+| Galaxy A52s (SD778G) | ORT CPU EP | FP32 | 4 | | | | | | | | | |

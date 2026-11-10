@@ -65,6 +65,7 @@ class SettingsRepository(private val context: Context) {
         val BACKEND_OVERRIDE = stringPreferencesKey("backend_override")
         val CPU_THREADS = intPreferencesKey("cpu_threads")
         val DUMP_TENSORS = booleanPreferencesKey("dump_tensors")
+        val RESUME_RUNS = booleanPreferencesKey("resume_runs")
     }
 
     /** HTP 调度类型 */
@@ -234,7 +235,9 @@ class SettingsRepository(private val context: Context) {
         /** ORT CPU threads; 0 = auto (big-core count) */
         val cpuThreads: Int = 0,
         /** Dump raw model outputs to files/dumps/ after each run (for tools/compare_outputs.py) */
-        val dumpTensors: Boolean = false
+        val dumpTensors: Boolean = false,
+        /** Resume an interrupted run of the same image from its checkpoint */
+        val resumeRuns: Boolean = true
     )
 
     /** Backend override: AUTO probes HTP and falls back to CPU; HTP/CPU force one */
@@ -269,7 +272,8 @@ class SettingsRepository(private val context: Context) {
             imageDirectories = prefs[Keys.IMAGE_DIRECTORIES]?.split(",")?.filter { it.isNotBlank() }?.toSet() ?: emptySet(),
             backendOverride = BackendOverride.fromKey(prefs[Keys.BACKEND_OVERRIDE]),
             cpuThreads = prefs[Keys.CPU_THREADS] ?: 0,
-            dumpTensors = prefs[Keys.DUMP_TENSORS] ?: false
+            dumpTensors = prefs[Keys.DUMP_TENSORS] ?: false,
+            resumeRuns = prefs[Keys.RESUME_RUNS] ?: true
         )
     }
 
@@ -363,6 +367,10 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setCpuThreads(n: Int) {
         context.settingsDataStore.edit { it[Keys.CPU_THREADS] = n.coerceIn(0, 16) }
+    }
+
+    suspend fun setResumeRuns(enable: Boolean) {
+        context.settingsDataStore.edit { it[Keys.RESUME_RUNS] = enable }
     }
 
     suspend fun setDumpTensors(enable: Boolean) {

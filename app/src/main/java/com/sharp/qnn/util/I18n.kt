@@ -141,6 +141,8 @@ object MsgKey {
     const val DETAIL_COMPILING = "detail_compiling"
     const val DETAIL_COMPILED = "detail_compiled"
     const val DETAIL_CANCELLED = "detail_cancelled"
+    /** Stage restored from the run checkpoint (not recomputed) */
+    const val DETAIL_RESUMED = "detail_resumed"
     const val STAGE_PLY_PRUNE = "stage_ply_prune"
     const val STAGE_PLY_SOR = "stage_ply_sor"
     const val STAGE_PLY_KNN = "stage_ply_knn"
@@ -229,6 +231,7 @@ internal val messageResIds: Map<String, Int> = mapOf(
     MsgKey.DETAIL_COMPILING to R.string.detail_compiling,
     MsgKey.DETAIL_COMPILED to R.string.detail_compiled,
     MsgKey.DETAIL_CANCELLED to R.string.detail_cancelled,
+    MsgKey.DETAIL_RESUMED to R.string.detail_resumed,
     MsgKey.STAGE_PLY_PRUNE to R.string.stage_ply_prune,
     MsgKey.STAGE_PLY_SOR to R.string.stage_ply_sor,
     MsgKey.STAGE_PLY_KNN to R.string.stage_ply_knn

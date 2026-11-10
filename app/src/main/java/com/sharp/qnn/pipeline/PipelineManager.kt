@@ -60,6 +60,9 @@ class PipelineManager(
     // Per-run model load timings (ms), for the benchmark summary
     private val modelLoadMs = linkedMapOf<ModelType, Long>()
 
+    // Whether the current run resumed from a checkpoint (its timings are partial)
+    private var resumedRun = false
+
     // Runtime state
     @Volatile
     private var initialized = false
@@ -146,15 +149,29 @@ class PipelineManager(
                 // Init stage done
                 onStageComplete(PREPARE_STAGE_ID, "Initialization", System.currentTimeMillis() - pipelineStartTime)
 
-                // 2. Prepare the work directory
-                val workDir = File(context.cacheDir, "sharp_work").also {
-                    if (it.exists()) FileUtil.deleteRecursively(it)
-                    ensureDir(it)
+                // 2. Work directory + checkpoint: resume an interrupted run of the same
+                //    input/backend/models, otherwise start from a clean directory
+                val workDir = File(context.cacheDir, "sharp_work")
+                ensureDir(workDir)
+                val runKey = context.contentResolver.openInputStream(imageUri)?.let { stream ->
+                    RunCheckpoint.key(stream, overrideFpx, _backend.value?.name ?: "", activeModelFiles())
+                } ?: run {
+                    fail(MsgKey.ERR_COPY_IMAGE_FAILED)
+                    return@withContext Result.failure(IOException("cannot read input image"))
+                }
+                val ckpt = RunCheckpoint(workDir)
+                resumedRun = plySettings.resumeRuns && ckpt.canResume(runKey)
+                if (resumedRun) {
+                    android.util.Log.i(TAG, "Resuming interrupted run: completed stages ${ckpt.completed().sorted()}")
+                } else {
+                    FileUtil.deleteRecursively(workDir)
+                    ensureDir(workDir)
+                    ckpt.start(runKey)
                 }
 
                 // 3. Copy the input image
                 val fileName = FileUtil.getFileNameFromUri(context, imageUri)
-                android.util.Log.i(TAG, "=== Pipeline started, image=$fileName ===")
+                android.util.Log.i(TAG, "=== Pipeline started, image=$fileName, resumed=$resumedRun ===")
                 val ext = fileName.substringAfterLast('.', "jpg").lowercase()
                 val inputFile = File(workDir, "input.$ext")
                 if (!FileUtil.copyUriToFile(context, imageUri, inputFile)) {
@@ -164,87 +181,71 @@ class PipelineManager(
 
                 // 4. Stage 0: decode the image (prepImage)
                 val imageRaw = File(workDir, "image.raw")
-                val meta = runStage(0) {
-                    QnnJni.prepImage(inputFile.absolutePath, imageRaw.absolutePath)
-                } ?: run {
-                    fail(MsgKey.ERR_PREP_NULL)
-                    return@withContext Result.failure(IOException("prepImage failed"))
-                }
+                val meta = ckpt.prepMeta()?.takeIf { ckpt.isDone(0) }?.also { markResumed(0) }
+                    ?: runStage(0) {
+                        QnnJni.prepImage(inputFile.absolutePath, imageRaw.absolutePath)
+                    }?.also {
+                        ckpt.putPrepMeta(it)
+                        ckpt.markDone(0)
+                    }
+                    ?: run {
+                        fail(MsgKey.ERR_PREP_NULL)
+                        return@withContext Result.failure(IOException("prepImage failed"))
+                    }
                 prepMeta = meta
 
                 // 5. Stage 1: pre-process and split patches (runPre)
-                if (!runStage(1) { QnnJni.runPre(imageRaw.absolutePath, workDir.absolutePath) }) {
+                if (ckpt.isDone(1)) markResumed(1)
+                else if (runStage(1) { QnnJni.runPre(imageRaw.absolutePath, workDir.absolutePath) }) ckpt.markDone(1)
+                else {
                     fail(MsgKey.ERR_PRE_FAILED)
                     return@withContext Result.failure(IOException("runPre failed"))
                 }
 
-                // 6. Stage 2: PE inference (load model on-demand)
-                ensureModelLoaded(ModelType.PE)
-                if (!runStage(2) { QnnJni.runPatchEncoder(workDir.absolutePath) }) {
+                // 6. Stage 2: PE inference. A partially encoded run resumes per patch
+                //    (native skips patches whose outputs are already complete on disk)
+                if (!modelStage(ckpt, 2, ModelType.PE) { QnnJni.runPatchEncoder(workDir.absolutePath) }) {
                     fail(MsgKey.ERR_PE_INFER_FAILED)
                     return@withContext Result.failure(IOException("runPatchEncoder failed"))
                 }
-                // All PE outputs are on disk and the model is no longer needed:
-                // release its context memory immediately (QnnContext_free)
-                android.util.Log.i(TAG, "PE done, releasing PE model")
-                runCatching { QnnJni.freeModel(ModelType.PE.code) }
-                synchronized(loadedModelsLock) { loadedModels.remove(ModelType.PE) }
 
-                // 7. Stage 3: IE inference (load model on-demand)
-                ensureModelLoaded(ModelType.IE)
-                if (!runStage(3) { QnnJni.runImageEncoder(workDir.absolutePath) }) {
+                // 7. Stage 3: IE inference
+                if (!modelStage(ckpt, 3, ModelType.IE) { QnnJni.runImageEncoder(workDir.absolutePath) }) {
                     fail(MsgKey.ERR_IE_INFER_FAILED)
                     return@withContext Result.failure(IOException("runImageEncoder failed"))
                 }
-                android.util.Log.i(TAG, "IE done, releasing IE model")
-                runCatching { QnnJni.freeModel(ModelType.IE.code) }
-                synchronized(loadedModelsLock) { loadedModels.remove(ModelType.IE) }
 
-                // 8. Stage 4: Merge
                 // 8. Stage 4: Merge
                 // Note: directory names must match the JNI layer (sharp_jni.cpp): out_pe / out_ie
                 val peOutDir = File(workDir, "out_pe")
                 val ieOutDir = File(workDir, "out_ie")
-                if (!runStage(4) { QnnJni.runMerge(workDir.absolutePath, peOutDir.absolutePath, ieOutDir.absolutePath) }) {
+                if (ckpt.isDone(4)) markResumed(4)
+                else if (runStage(4) { QnnJni.runMerge(workDir.absolutePath, peOutDir.absolutePath, ieOutDir.absolutePath) }) ckpt.markDone(4)
+                else {
                     fail(MsgKey.ERR_MERGE_FAILED)
                     return@withContext Result.failure(IOException("runMerge failed"))
                 }
 
-                // 9. Stage 5: REST Seg A (feature fusion, load model on-demand)
-                ensureModelLoaded(ModelType.REST_A)
-                if (!runStage(5) { QnnJni.runRestSegA(workDir.absolutePath) }) {
+                // 9-11. Stages 5-7: REST segments A/B/C (each loads its model on demand
+                //       and releases it right after; outputs persist in the work dir)
+                if (!modelStage(ckpt, 5, ModelType.REST_A) { QnnJni.runRestSegA(workDir.absolutePath) }) {
                     fail(MsgKey.ERR_REST_A_FAILED)
                     return@withContext Result.failure(IOException("runRestSegA failed"))
                 }
-                android.util.Log.i(TAG, "REST A done, releasing REST_A model")
-                runCatching { QnnJni.freeModel(ModelType.REST_A.code) }
-                synchronized(loadedModelsLock) { loadedModels.remove(ModelType.REST_A) }
-
-                // 10. Stage 6: REST Seg B (disparity estimation, load model on-demand)
-                ensureModelLoaded(ModelType.REST_B)
-                if (!runStage(6) { QnnJni.runRestSegB(workDir.absolutePath) }) {
+                if (!modelStage(ckpt, 6, ModelType.REST_B) { QnnJni.runRestSegB(workDir.absolutePath) }) {
                     fail(MsgKey.ERR_REST_B_FAILED)
                     return@withContext Result.failure(IOException("runRestSegB failed"))
                 }
-                android.util.Log.i(TAG, "REST B done, releasing REST_B model")
-                runCatching { QnnJni.freeModel(ModelType.REST_B.code) }
-                synchronized(loadedModelsLock) { loadedModels.remove(ModelType.REST_B) }
-
-                // 11. Stage 7: REST Seg C (Gaussian increment, load model on-demand)
-                ensureModelLoaded(ModelType.REST_C)
                 val fpx = overrideFpx ?: (prepMeta?.getOrNull(0) ?: 0f)
                 val origW = (prepMeta?.getOrNull(2) ?: 0f).toInt()
                 val origH = (prepMeta?.getOrNull(3) ?: 0f).toInt()
-                if (!runStage(7) { QnnJni.runRestSegC(workDir.absolutePath, fpx, origW) }) {
+                if (!modelStage(ckpt, 7, ModelType.REST_C) { QnnJni.runRestSegC(workDir.absolutePath, fpx, origW) }) {
                     fail(MsgKey.ERR_REST_C_FAILED)
                     return@withContext Result.failure(IOException("runRestSegC failed"))
                 }
-                // REST C output is on disk (delta.raw); the model is no longer needed
-                android.util.Log.i(TAG, "REST C done, releasing REST_C model")
-                runCatching { QnnJni.freeModel(ModelType.REST_C.code) }
-                synchronized(loadedModelsLock) { loadedModels.remove(ModelType.REST_C) }
 
-                // 12. Stage 8: Post (PLY generation)
+                // 12. Stage 8: Post (PLY generation). Post and PLY optimization always re-run:
+                //     they take seconds, and optimization rewrites output.ply in place
                 val plyPath = File(workDir, "output.ply").absolutePath
                 if (!runStage(8) { QnnJni.runPost(workDir.absolutePath, fpx, origW, origH, plyPath) }) {
                     fail(MsgKey.ERR_POST_FAILED)
@@ -283,6 +284,7 @@ class PipelineManager(
                 }
 
                 // Done
+                ckpt.markFinished()
                 val totalElapsed = System.currentTimeMillis() - pipelineStartTime - dumpMs
                 android.util.Log.i(TAG, "=== Pipeline done, total ${totalElapsed}ms, PLY=$plyPath ===")
                 val peakMb = QnnJni.getPeakRssKb() / 1024
@@ -532,6 +534,41 @@ class PipelineManager(
         synchronized(loadedModelsLock) { loadedModels.add(type) }
     }
 
+    // ====== Checkpointed stages (resume after a crash) ======
+
+    /**
+     * Run a model stage with checkpointing: skipped if [ckpt] already has it; otherwise
+     * loads [type], runs [block], releases the model and records the stage as done.
+     */
+    private suspend fun modelStage(ckpt: RunCheckpoint, stageId: Int, type: ModelType, block: () -> Boolean): Boolean {
+        if (ckpt.isDone(stageId)) {
+            markResumed(stageId)
+            return true
+        }
+        ensureModelLoaded(type)
+        val ok = runStage(stageId, block)
+        // Outputs are on disk; release the model right away to keep the next stage's peak low
+        android.util.Log.i(TAG, "${type.code} done (ok=$ok), releasing model")
+        runCatching { QnnJni.freeModel(type.code) }
+        synchronized(loadedModelsLock) { loadedModels.remove(type) }
+        if (ok) ckpt.markDone(stageId)
+        return ok
+    }
+
+    /** Show a stage restored from the checkpoint as complete */
+    private fun markResumed(stageId: Int) {
+        android.util.Log.i(TAG, "Stage $stageId resumed from checkpoint")
+        updateStage(stageId) {
+            it.copy(isRunning = false, isComplete = true, current = it.total, elapsedMs = 0, detail = MsgKey.DETAIL_RESUMED)
+        }
+    }
+
+    /** Model files the active backend runs (part of the checkpoint key) */
+    private fun activeModelFiles(): List<File> = ModelType.coreTypes.mapNotNull { type ->
+        if (isCpuBackend) modelStore.onnxModelFile(type)
+        else modelStore.getModel(type)?.runtimeBinPath?.let { File(it) }
+    }
+
     // ====== Instrumentation: benchmark summary + tensor dumps ======
 
     /** One-line, grep-able benchmark summary (logcat tag [BENCH_TAG]) */
@@ -541,7 +578,7 @@ class PipelineManager(
             .joinToString(" ") { "s${it.id}=${it.elapsedMs}" }
         val loads = modelLoadMs.entries.joinToString(" ") { "load_${it.key.code}=${it.value}" }
         return "backend=${b?.name ?: "?"} threads=${b?.threads ?: 0} precision=${if (b?.isCpu == true) "fp32" else "w8a16"} " +
-            "total_ms=$totalMs peak_rss_mb=$peakMb $stages $loads device=${android.os.Build.MODEL} soc=${android.os.Build.SOC_MODEL}"
+            "resumed=$resumedRun total_ms=$totalMs peak_rss_mb=$peakMb $stages $loads device=${android.os.Build.MODEL} soc=${android.os.Build.SOC_MODEL}"
     }
 
     /**
@@ -585,6 +622,7 @@ class PipelineManager(
             })
             put("model_load_ms", org.json.JSONObject().apply { modelLoadMs.forEach { (k, v) -> put(k.code, v) } })
             put("peak_rss_mb", QnnJni.getPeakRssKb() / 1024)
+            put("resumed", resumedRun)
         }
         File(out, "meta.json").writeText(meta.toString(2))
         android.util.Log.i(BENCH_TAG, "tensor dump: ${out.absolutePath} (${bytes / 1_000_000} MB)")

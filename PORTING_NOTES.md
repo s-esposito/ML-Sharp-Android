@@ -1,7 +1,7 @@
 # Porting notes: ML-Sharp-QNN → non-Snapdragon Android (target: Galaxy A57 / Exynos 1680)
 
 Running log of findings, decisions, benchmarks and open questions.
-Phase status: Phase 0 complete (merged). **Phase 1 in progress** on `phase1-cpu-fallback`: code complete, desktop-verified, waiting on the build toolchain (QNN SDK, NDK) for the on-device test.
+Phase status: Phase 0 complete (merged). **Phase 1 in progress, paused 2026-11-10** on `phase1-cpu-fallback`. It builds and runs on the A52s (CPU fallback through REST_A), but REST_B FP32 runs out of memory on the 5.5 GB device (§8d). HTP isn't detected on v68 (§8d). Resume-after-crash is in place (§8e).
 
 ---
 
@@ -193,6 +193,16 @@ Setup: debug APK (`0696772` + Home gating fix), QNN SDK 2.52 libs, upstream W8A1
    * The head is purely local (3×3 conv, 2×2 stride-2 transposed conv, 3×3 conv, 1×1 conv), so it can be **run in spatial tiles with a small halo and give exact results**. The same holds for the full-resolution parts of seg C.
    * For the A57 (8/12 GB), FP32 at ~4.6 GB peak probably fits; 8 GB is borderline.
 5. **HTP on the A52s:** to investigate. Is `deviceGetPlatformInfo` failing because of QNN 2.52 on v68, unsigned-PD support on SM7325, or missing env/skel at probe time? Upstream never claimed v68 support.
+
+## 8e. Resume after a crash (2026-11-10)
+
+Intermediates already lived on disk in `cacheDir/sharp_work/`. What was missing was knowing which were complete, and two places wiped them: every run, and **every image selection** (HomeScreen).
+
+* `RunCheckpoint` (`checkpoint.json` in the work dir, written atomically) records the completed stages and the prepImage metadata under a key: `v1|input=<sha1>|fpx=<override>|backend=<name>|models=<sha1 of model path:size:mtime>`. A run resumes only if the key matches and the previous run did not finish. A finished run, a different image or a different backend/model set starts fresh, so benchmarks stay clean. On a mismatch the log says which part changed (tag `RunCheckpoint`).
+* PE resumes **per patch**: native code skips patches whose 3 output files exist at their exact byte size, so a write truncated by a crash is recomputed.
+* Post and PLY optimisation always re-run, because optimisation rewrites `output.ply` in place.
+* Setting "Resume interrupted runs" (default on). `SHARP_BENCH` and the dump `meta.json` carry `resumed=true/false`.
+* **Verified on the A52s:** a force-stop during PE followed by a relaunch logged `resumed=true`, restored stages 0–1, and kept accumulating PE patches across restarts (28/35 after three short attempts).
 
 ## 9. Open questions
 

@@ -138,6 +138,10 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setResumeRuns(enable: Boolean) {
+        viewModelScope.launch { sharpApp.settingsRepository.setResumeRuns(enable) }
+    }
+
     fun setDumpTensors(enable: Boolean) {
         viewModelScope.launch { sharpApp.settingsRepository.setDumpTensors(enable) }
     }
@@ -627,6 +631,15 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     }
                 }
             }
+        }
+
+        item {
+            SwitchSettingRow(
+                title = stringResource(R.string.settings_resume_runs),
+                description = stringResource(R.string.settings_resume_runs_desc),
+                checked = settings.resumeRuns,
+                onCheckedChange = { vm.setResumeRuns(it) }
+            )
         }
 
         item {

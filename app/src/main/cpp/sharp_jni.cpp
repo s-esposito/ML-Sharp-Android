@@ -752,7 +752,28 @@ Java_com_sharp_qnn_pipeline_QnnJni_runPatchEncoder(JNIEnv* env, jobject thiz, js
         outputs[j].count = outBuffers[j].size();
     }
 
+    // Resume support: a patch whose outputs are all on disk at their exact size was
+    // completed by an earlier (interrupted) run of the same checkpoint; skip it.
+    // A crash mid-write leaves a short file, so that patch is recomputed.
+    auto patchDone = [&](int i) {
+        for (size_t j = 0; j < outputs.size(); j++) {
+            char outPath[256];
+            snprintf(outPath, sizeof(outPath), "%s/out_pe/Result_%d/%s.raw",
+                     workDir.c_str(), i, outputs[j].name.c_str());
+            struct stat st;
+            if (stat(outPath, &st) != 0 || (size_t)st.st_size != outputs[j].count * sizeof(float))
+                return false;
+        }
+        return true;
+    };
+    int resumed = 0;
+
     for (int i = 0; i < NUM_PATCHES; i++) {
+        if (patchDone(i)) {
+            resumed++;
+            cbProgress(2, i + 1, NUM_PATCHES, 0, "resumed");
+            continue;
+        }
         // Read the patch raw file
         char patchName[64];
         snprintf(patchName, sizeof(patchName), "%s/patch_p%04d.raw", workDir.c_str(), i);
@@ -800,7 +821,8 @@ Java_com_sharp_qnn_pipeline_QnnJni_runPatchEncoder(JNIEnv* env, jobject thiz, js
         cbProgress(2, i + 1, NUM_PATCHES, ms, detail);
     }
 
-    LOGI("runPatchEncoder exit RSS=%zuKB", selfVmRSS_kB());
+    LOGI("runPatchEncoder exit RSS=%zuKB (%d/%d patches resumed from disk)",
+         selfVmRSS_kB(), resumed, NUM_PATCHES);
     return JNI_TRUE;
 }
 

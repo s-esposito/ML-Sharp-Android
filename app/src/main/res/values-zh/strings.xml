@@ -345,4 +345,7 @@
     <string name="home_backend_chip">后端: %1$s</string>
     <string name="home_run_summary">%1$s · 峰值内存 %2$d MB</string>
     <string name="err_needs_npu">此功能需要 NPU (QNN HTP)。当前设备使用 CPU 后端 (ONNX Runtime)。</string>
+    <string name="detail_resumed">已从检查点恢复</string>
+    <string name="settings_resume_runs">恢复中断的运行</string>
+    <string name="settings_resume_runs_desc">运行崩溃或被系统终止后, 对同一图片的下一次运行会从最后完成的阶段继续 (中间结果保存在应用缓存中)。关闭则每次从头开始。</string>
 </resources>

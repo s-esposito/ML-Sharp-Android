@@ -380,16 +380,13 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         _savedExifFocalMm = null
         _anyCalibRunning.value = false
 
-        // Clear previous inference artifacts (excluding exported PLY) when re-selecting an image
-        // Clear previous inference products and remnants when reselecting
-        // (exported PLY files are not touched). Only reset when idle.
+        // Reset the in-memory pipeline state when re-selecting an image (only when idle).
+        // The work dir is NOT deleted here: it holds the checkpoint of an interrupted
+        // run, and the pipeline itself wipes it when the next run's key (input image,
+        // focal, backend, models) differs (see RunCheckpoint).
         if (!pipelineState.value.isRunning) {
             viewModelScope.launch(Dispatchers.IO) {
                 sharpApp.pipelineManager.reset()
-                val workDir = File(sharpApp.cacheDir, "sharp_work")
-                if (workDir.exists()) {
-                    FileUtil.deleteRecursively(workDir)
-                }
             }
         }
 

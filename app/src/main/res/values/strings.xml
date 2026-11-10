@@ -343,4 +343,7 @@
     <string name="home_backend_chip">Backend: %1$s</string>
     <string name="home_run_summary">%1$s · peak memory %2$d MB</string>
     <string name="err_needs_npu">This needs the NPU (QNN HTP). This device is using the CPU backend (ONNX Runtime).</string>
+    <string name="detail_resumed">Resumed from checkpoint</string>
+    <string name="settings_resume_runs">Resume interrupted runs</string>
+    <string name="settings_resume_runs_desc">If a run crashes or is killed, the next run on the same image continues from the last completed stage (intermediates are kept in the app cache). Turn off to always start from scratch.</string>
 </resources>

@@ -22,3 +22,15 @@ app/release/
 .DS_Store
 Thumbs.db
 .ai-memory/
+# Model artifacts / SDKs / conversion outputs (never commit; see PORTING_NOTES.md)
+output/
+*.dlc
+*.onnx
+*.onnx.data
+*.ort
+*.pt
+*.pth
+*.bin
+*.raw
+*.ply
+dumps/
